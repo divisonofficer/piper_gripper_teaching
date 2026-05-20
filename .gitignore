@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.venv/
+venv/
+env/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/build/
+frontend/.cache/
+*.tsbuildinfo
+
+# SSL certificates (sensitive)
+*.pem
+*.key
+*.crt
+
+# Dataset (large binary data — managed separately)
+dataset/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Compiled ROS
+devel/
+install/
+log/
