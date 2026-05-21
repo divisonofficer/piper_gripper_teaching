@@ -45,10 +45,12 @@ app.config["CONTROLLER"] = controller
 from routes.capture_routes import bp as capture_bp
 from routes.robot_routes import bp as robot_bp
 from routes.episode_routes import bp as episode_bp
+from routes.mask_routes import bp as mask_bp
 
 app.register_blueprint(capture_bp)
 app.register_blueprint(robot_bp)
 app.register_blueprint(episode_bp)
+app.register_blueprint(mask_bp)
 
 # ── MJPEG 카메라 스트리밍 ─────────────────────────────────────────────
 

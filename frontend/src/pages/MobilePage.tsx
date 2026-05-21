@@ -29,6 +29,9 @@ export default function MobileApp() {
   // Teaching mode (TEACH_READY에서 선택, TEACH_RECORDING에서 고정)
   const [teachMode, setTeachMode] = useState<TeachMode>("freedrive");
 
+  // Replay speed
+  const [speedScale, setSpeedScale] = useState(0.5);
+
   // Freedrive
   const [motorsFree, setMotorsFree] = useState(false);
   const [disableCountdown, setDisableCountdown] = useState(0);
@@ -240,7 +243,7 @@ export default function MobileApp() {
           <MSection title="System Ready">
             <MBtn label="Confirm Ready Pose" onClick={() => post("/api/ready")} primary disabled={!can("confirm_ready_pose")} />
             <MBtn label="Calibrate Joint Range" onClick={() => post("/api/robot/calibrate/start")} disabled={!can("calibrate")} />
-            <GripperRow can={can} />
+            <GripperRow can={can} gripperRad={robot.gripper} />
             <FreedriveSetting motorsFree={motorsFree} disableCountdown={disableCountdown}
               onStartCountdown={handleStartFreedriveCountdown}
               onCancelCountdown={handleCancelFreedriveCountdown}
@@ -280,7 +283,7 @@ export default function MobileApp() {
             </div>
             <MBtn label="Start Teaching" onClick={handleStartTeach} primary disabled={!can("start_teach")} />
             <MBtn label="Calibrate Joint Range" onClick={() => post("/api/robot/calibrate/start")} disabled={!can("calibrate")} />
-            <GripperRow can={can} />
+            <GripperRow can={can} gripperRad={robot.gripper} />
             <FreedriveSetting motorsFree={motorsFree} disableCountdown={disableCountdown}
               onStartCountdown={handleStartFreedriveCountdown}
               onCancelCountdown={handleCancelFreedriveCountdown}
@@ -291,7 +294,7 @@ export default function MobileApp() {
         {/* TEACH_RECORDING */}
         {mode === "TEACH_RECORDING" && (
           <MSection title="Teaching in Progress">
-            <GripperRow can={can} />
+            <GripperRow can={can} gripperRad={robot.gripper} />
 
             {teachMode === "phone_mouse" && pmActive ? (
               /* ── Cartesian Jog 모드 ── */
@@ -324,7 +327,8 @@ export default function MobileApp() {
         {/* TRAJECTORY_CHECK */}
         {mode === "TRAJECTORY_CHECK" && (
           <MSection title="Trajectory Recorded">
-            <MBtn label="Return Home" onClick={() => post("/api/home")} primary disabled={!can("return_home")} />
+            <MBtn label="↩ Return (Backtrace)" onClick={() => post("/api/home")} primary disabled={!can("return_home")} />
+            <MBtn label="⚡ Return Direct" onClick={() => post("/api/home/direct")} disabled={!can("return_home_direct")} />
             <MBtn label="Discard & Retake" onClick={() => post("/api/episodes/discard")} disabled={!can("discard_episode")} />
           </MSection>
         )}
@@ -340,8 +344,18 @@ export default function MobileApp() {
         {/* REPLAY_READY */}
         {mode === "REPLAY_READY" && (
           <MSection title="Ready for Replay">
-            <MBtn label="Start Replay & Record" onClick={() => post("/api/replay/start")} primary disabled={!can("start_replay")} />
-            <GripperRow can={can} />
+            <SpeedControl speedScale={speedScale} onChange={setSpeedScale} />
+            <MBtn
+              label={`Start Replay & Record (${Math.round(speedScale * 100)}%)`}
+              onClick={() => fetch("/api/replay/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ speed_scale: speedScale }),
+              })}
+              primary
+              disabled={!can("start_replay")}
+            />
+            <GripperRow can={can} gripperRad={robot.gripper} />
             <MBtn label="Hold Position" onClick={() => post("/api/hold")} danger disabled={!can("hold_position")} />
           </MSection>
         )}
@@ -352,7 +366,7 @@ export default function MobileApp() {
             <div style={{ ...S.hint, color: "#dc2626", fontWeight: 700 }}>
               Stay away from the robot's workspace.
             </div>
-            <GripperRow can={can} />
+            <GripperRow can={can} gripperRad={robot.gripper} />
             <MBtn label="STOP REPLAY" onClick={() => post("/api/replay/stop")} primary large disabled={!can("stop_replay")} />
             <MBtn label="Hold Position" onClick={() => post("/api/hold")} danger disabled={!can("hold_position")} />
           </MSection>
@@ -361,7 +375,29 @@ export default function MobileApp() {
         {/* REVIEW */}
         {mode === "REVIEW" && (
           <MSection title="Episode Review">
-            <div style={S.hint}>Review the episode on the main screen.</div>
+            <div style={S.hint}>Review on the main screen, then save or discard.</div>
+            <MBtn
+              label="✓ Save — Success"
+              onClick={() => fetch("/api/episodes/save", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ success: true, reason: "" }),
+              })}
+              primary
+              disabled={!can("save_episode")}
+            />
+            <MBtn
+              label="✗ Save — Failure"
+              onClick={() => fetch("/api/episodes/save", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ success: false, reason: "" }),
+              })}
+              disabled={!can("save_episode")}
+            />
+            <MBtn label="Discard & Retake (Replay)" onClick={() => post("/api/episodes/retake_replay")} disabled={!can("retake_replay")} />
+            <MBtn label="Discard & Retake (Teach)" onClick={() => post("/api/episodes/retake_teach")} disabled={!can("retake_teach")} />
+            <MBtn label="Discard" onClick={() => post("/api/episodes/discard")} danger disabled={!can("discard_episode")} />
           </MSection>
         )}
 
@@ -408,9 +444,27 @@ function MSection({ title, children }: { title: string; children: React.ReactNod
   );
 }
 
-function GripperRow({ can }: { can: (a: string) => boolean }) {
-  const [pct, setPct] = React.useState(100);
+const GRIPPER_OPEN_RAD_M = 0.07;
+const GRIPPER_SNAPS_M = [0, 100];
+
+function radToSnapPctM(rad: number): number {
+  const raw = Math.round((rad / GRIPPER_OPEN_RAD_M) * 100);
+  return GRIPPER_SNAPS_M.reduce((prev, curr) =>
+    Math.abs(curr - raw) < Math.abs(prev - raw) ? curr : prev
+  );
+}
+
+function GripperRow({ can, gripperRad }: { can: (a: string) => boolean; gripperRad?: number }) {
+  const [pct, setPct] = React.useState(() =>
+    gripperRad !== undefined ? radToSnapPctM(gripperRad) : 100
+  );
   const canAny = can("open_gripper") || can("close_gripper") || can("gripper_set");
+
+  React.useEffect(() => {
+    if (gripperRad !== undefined) {
+      setPct(radToSnapPctM(gripperRad));
+    }
+  }, [gripperRad]);
 
   const sendGripper = (val: number) => {
     if (val === 0) {
@@ -424,7 +478,7 @@ function GripperRow({ can }: { can: (a: string) => boolean }) {
     }
   };
 
-  const SNAPS = [0, 50, 100];
+  const SNAPS = [0, 100];
 
   return (
     <div style={{ background: "#1e293b", borderRadius: 12, padding: "12px 14px", marginBottom: 8 }}>
@@ -434,7 +488,7 @@ function GripperRow({ can }: { can: (a: string) => boolean }) {
       {/* 슬라이더 */}
       <input
         type="range"
-        min={0} max={100} step={50}
+        min={0} max={100} step={100}
         value={pct}
         disabled={!canAny}
         onChange={e => {
@@ -489,6 +543,35 @@ function FreedriveSetting({
       ) : (
         <MBtn label="Release Motors (Freedrive)" onClick={onStartCountdown} />
       )}
+    </div>
+  );
+}
+
+const SPEED_PRESETS = [0.3, 0.5, 0.7, 1.0];
+
+function SpeedControl({ speedScale, onChange }: { speedScale: number; onChange: (v: number) => void }) {
+  return (
+    <div style={{ background: "#1e293b", borderRadius: 12, padding: "12px 14px", marginBottom: 8 }}>
+      <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase" as const, letterSpacing: 0.8, marginBottom: 10 }}>
+        Replay Speed — {Math.round(speedScale * 100)}%
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+        {SPEED_PRESETS.map(v => (
+          <button
+            key={v}
+            onClick={() => onChange(v)}
+            style={{
+              flex: 1, padding: "10px 0", borderRadius: 8, border: "none",
+              background: speedScale === v ? "#4f46e5" : "#0f172a",
+              color: speedScale === v ? "#fff" : "#94a3b8",
+              fontWeight: 700, fontSize: 13, cursor: "pointer",
+              touchAction: "manipulation",
+            }}
+          >
+            {Math.round(v * 100)}%
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

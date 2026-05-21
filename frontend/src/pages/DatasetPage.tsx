@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import type { Episode, EpisodeTake, JointSample, TakeJointsData, EESample, TakeTrajectoryData } from "../types";
+import type { Episode, EpisodeTake, JointSample, TakeJointsData, EESample, TakeTrajectoryData, EditMeta, MaskMeta, MaskLibraryEntry } from "../types";
 
 // ── Constants ────────────────────────────────────────────────────────────
 const JOINT_COLORS = ["#6366f1", "#06b6d4", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6"];
@@ -314,6 +314,16 @@ export default function DatasetPage() {
   const [confirmDeleteTake, setConfirmDeleteTake] = useState<string | null>(null);
   const [editingTask, setEditingTask] = useState(false);
   const [taskDraft, setTaskDraft] = useState("");
+  const [selectedEps, setSelectedEps] = useState<Set<string>>(new Set());
+  const [includeFrames, setIncludeFrames] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportingLerobot, setExportingLerobot] = useState(false);
+  const [bulkTask, setBulkTask] = useState("");
+  const [bulkTaskSaving, setBulkTaskSaving] = useState(false);
+  const [editMeta, setEditMeta] = useState<EditMeta | null>(null);
+  const [sortBy, setSortBy] = useState<"date" | "task">("date");
+  const [hoveredEp, setHoveredEp] = useState<string | null>(null);
+  const [exportModal, setExportModal] = useState(false);
 
   const fetchEpisodes = useCallback(() => {
     fetch("/api/episodes")
@@ -354,6 +364,14 @@ export default function DatasetPage() {
       .catch(() => { setTrajectoryData(null); setTrajLoading(false); });
   }, [selectedId, selectedTake]);
 
+  useEffect(() => {
+    if (!selectedId || !selectedTake) { setEditMeta(null); return; }
+    fetch(`/api/episodes/${selectedId}/takes/${selectedTake}/edit_meta`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => setEditMeta(d))
+      .catch(() => setEditMeta(null));
+  }, [selectedId, selectedTake]);
+
   const filtered = useMemo(() => episodes.filter(ep => {
     if (filter === "success" && ep.success !== true) return false;
     if (filter === "failure" && ep.success !== false) return false;
@@ -364,6 +382,13 @@ export default function DatasetPage() {
     }
     return true;
   }), [episodes, filter, search]);
+
+  const sorted = useMemo(() => {
+    if (sortBy === "task") {
+      return [...filtered].sort((a, b) => (a.task ?? "").localeCompare(b.task ?? ""));
+    }
+    return filtered;
+  }, [filtered, sortBy]);
 
   const totalSize = useMemo(() =>
     episodes.reduce((s, e) => s + (e.size_mb ?? 0), 0), [episodes]);
@@ -414,6 +439,120 @@ export default function DatasetPage() {
     }).catch(() => {});
   }, []);
 
+  const toggleEpSelect = useCallback((epId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSelectedEps(prev => {
+      const next = new Set(prev);
+      next.has(epId) ? next.delete(epId) : next.add(epId);
+      return next;
+    });
+  }, []);
+
+  const exportSelected = useCallback(() => {
+    if (!selectedEps.size || exporting) return;
+    setExporting(true);
+    fetch("/api/episodes/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_ids: [...selectedEps], include_frames: includeFrames }),
+    })
+      .then(r => {
+        if (!r.ok) throw new Error("export failed");
+        return r.blob();
+      })
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `piper_dataset_${selectedEps.size}ep.zip`;
+        a.click();
+        URL.revokeObjectURL(url);
+      })
+      .catch(() => {})
+      .finally(() => setExporting(false));
+  }, [selectedEps, includeFrames, exporting]);
+
+  const exportLerobot = useCallback(() => {
+    if (!selectedEps.size || exportingLerobot) return;
+    setExportingLerobot(true);
+    fetch("/api/episodes/export_lerobot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_ids: [...selectedEps] }),
+    })
+      .then(r => {
+        if (!r.ok) throw new Error("export_lerobot failed");
+        return r.blob();
+      })
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `piper_lerobot_${selectedEps.size}ep.zip`;
+        a.click();
+        URL.revokeObjectURL(url);
+      })
+      .catch(() => {})
+      .finally(() => setExportingLerobot(false));
+  }, [selectedEps, exportingLerobot]);
+
+  const applyBulkTask = useCallback(() => {
+    if (!selectedEps.size || bulkTaskSaving) return;
+    setBulkTaskSaving(true);
+    const ids = [...selectedEps];
+    Promise.all(ids.map(id =>
+      fetch(`/api/episodes/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: bulkTask }),
+      })
+    )).then(() => {
+      const task = bulkTask;
+      setEpisodes(prev => prev.map(e => selectedEps.has(e.episode_id) ? { ...e, task } : e));
+      setSelected(prev => prev && selectedEps.has(prev.episode_id) ? { ...prev, task } : prev);
+    }).catch(() => {}).finally(() => setBulkTaskSaving(false));
+  }, [selectedEps, bulkTask, bulkTaskSaving]);
+
+  const saveEditMeta = useCallback((meta: EditMeta) => {
+    if (!selectedId || !selectedTake) return;
+    fetch(`/api/episodes/${selectedId}/takes/${selectedTake}/edit_meta`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(meta),
+    }).then(() => setEditMeta(meta)).catch(() => {});
+  }, [selectedId, selectedTake]);
+
+  // 자동 그리퍼 열림 감지: teach 데이터에서 10초 이후 closed→open 전환 시각
+  const autoGripperOpenT = useMemo((): number | null => {
+    const samples = jointsData?.teach;
+    if (!samples) return null;
+    const MID = 0.02219;
+    let prevOpen: boolean | null = null;
+    for (const s of samples) {
+      const isOpen = s.gripper > MID;
+      if (prevOpen !== null && s.t > 10 && !prevOpen && isOpen) return s.t;
+      prevOpen = isOpen;
+    }
+    return null;
+  }, [jointsData]);
+
+  const selectSameTask = useCallback(() => {
+    // 현재 선택된 에피소드들의 task 집합 추출
+    const tasks = new Set(
+      episodes
+        .filter(e => selectedEps.has(e.episode_id))
+        .map(e => e.task ?? "")
+    );
+    // filtered 목록 기준으로 같은 task인 에피소드 모두 추가
+    setSelectedEps(prev => {
+      const next = new Set(prev);
+      filtered.forEach(e => {
+        if (tasks.has(e.task ?? "")) next.add(e.episode_id);
+      });
+      return next;
+    });
+  }, [episodes, filtered, selectedEps]);
+
   const nearestSample = useMemo((): EESample | null => {
     const arr = trajectoryData?.[jointSource];
     if (!arr || !arr.length) return null;
@@ -445,7 +584,7 @@ export default function DatasetPage() {
         <div style={styles.headerLeft}>
           <h2 style={styles.title}>Dataset Browser</h2>
           <span style={styles.stats}>
-            {filtered.length}/{episodes.length} episodes · {totalTakes} takes · {fmtMb(totalSize)}
+            {sorted.length}/{episodes.length} ep · {totalTakes} takes · {fmtMb(totalSize)}
           </span>
         </div>
         <div style={styles.headerRight}>
@@ -460,48 +599,120 @@ export default function DatasetPage() {
               {f === "all" ? "All" : f === "success" ? "✓" : f === "failure" ? "✗" : "?"}
             </button>
           ))}
+          <select value={sortBy} onChange={e => setSortBy(e.target.value as "date" | "task")}
+            style={{ padding: "3px 6px", borderRadius: 5, border: "1px solid #e5e7eb", fontSize: 11, background: "#fff" }}>
+            <option value="date">최신순</option>
+            <option value="task">task순</option>
+          </select>
           <button style={styles.refreshBtn} onClick={fetchEpisodes}>↻</button>
         </div>
       </div>
+
+      {/* Selection Toolbar */}
+      {selectedEps.size > 0 && (
+        <div style={styles.exportBar}>
+          <span style={{ fontSize: 12, color: "#1e293b", fontWeight: 600, flexShrink: 0 }}>
+            {selectedEps.size}개 선택
+          </span>
+          <button onClick={selectSameTask} style={{ ...styles.exportBarBtn, background: "#0891b2", fontSize: 11 }}>
+            같은 task 선택
+          </button>
+          <input
+            type="text" placeholder="task 일괄 설정…" value={bulkTask}
+            onChange={e => setBulkTask(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") applyBulkTask(); }}
+            style={{ ...styles.bulkTaskInput, width: 180 }}
+          />
+          <button onClick={applyBulkTask} disabled={bulkTaskSaving || !bulkTask.trim()}
+            style={{ ...styles.exportBarBtn, fontSize: 11 }}>
+            {bulkTaskSaving ? "…" : "Set"}
+          </button>
+          <div style={{ flex: 1 }} />
+          <button onClick={() => setExportModal(true)}
+            style={{ ...styles.exportBarBtn, background: "#059669", fontSize: 11 }}>
+            ↓ Export
+          </button>
+          <button onClick={() => setSelectedEps(new Set())}
+            style={{ ...styles.cancelBtn, fontSize: 11 }}>
+            Clear
+          </button>
+        </div>
+      )}
+
+      {/* Export Modal */}
+      {exportModal && (
+        <ExportModal
+          count={selectedEps.size}
+          exporting={exporting}
+          exportingLerobot={exportingLerobot}
+          includeFrames={includeFrames}
+          onIncludeFrames={setIncludeFrames}
+          onExportZip={exportSelected}
+          onExportLerobot={exportLerobot}
+          onClose={() => setExportModal(false)}
+        />
+      )}
 
       {/* Body */}
       <div style={styles.body}>
         {/* Episode list */}
         <div style={styles.listPanel}>
-          {filtered.length === 0 && (
+          {sorted.length === 0 && (
             <div style={styles.empty}>
               {search || filter !== "all" ? "No matches." : "No episodes yet."}
             </div>
           )}
-          {filtered.map(ep => (
-            <div key={ep.episode_id}
-              style={{ ...styles.epRow, background: selected?.episode_id === ep.episode_id ? "#eef2ff" : "#fff" }}
-              onClick={() => { setSelected(ep); setConfirmDeleteEp(null); }}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={styles.epId}>{ep.episode_id.slice(-20)}</div>
-                <div style={styles.epTask}>{ep.task || "—"}</div>
-                <div style={styles.epMeta}>
-                  <StatusBadge success={ep.success} />
-                  <span style={styles.metaText}>{ep.takes_count ?? 0}t</span>
-                  <span style={styles.metaText}>{fmtMb(ep.size_mb)}</span>
-                  <span style={styles.metaText}>{ep.created_at?.slice(5, 16).replace("T", " ")}</span>
+          {sorted.map(ep => {
+            const isSelected = selected?.episode_id === ep.episode_id;
+            const isHovered = hoveredEp === ep.episode_id;
+            const showDelete = isHovered || confirmDeleteEp === ep.episode_id;
+            return (
+              <div key={ep.episode_id}
+                style={{ ...styles.epRow, background: isSelected ? "#eef2ff" : "#fff" }}
+                onClick={() => { setSelected(ep); setConfirmDeleteEp(null); }}
+                onMouseEnter={() => setHoveredEp(ep.episode_id)}
+                onMouseLeave={() => setHoveredEp(null)}>
+                <input
+                  type="checkbox"
+                  checked={selectedEps.has(ep.episode_id)}
+                  onChange={() => {}}
+                  onClick={e => toggleEpSelect(ep.episode_id, e)}
+                  style={styles.checkbox}
+                />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={styles.epId}>{ep.episode_id.slice(-18)}</span>
+                    {ep.has_postprocess && (
+                      <span title="postprocess 편집 있음"
+                        style={{ fontSize: 9, background: "#dbeafe", color: "#1d4ed8", borderRadius: 3, padding: "0 4px", fontWeight: 700 }}>
+                        ✂
+                      </span>
+                    )}
+                  </div>
+                  <div style={styles.epMeta}>
+                    <StatusBadge success={ep.success} />
+                    <span style={styles.metaText}>{ep.task || "—"}</span>
+                    <span style={{ ...styles.metaText, marginLeft: "auto" }}>{ep.takes_count ?? 0}t · {fmtMb(ep.size_mb)}</span>
+                  </div>
                 </div>
-              </div>
-              <div style={{ flexShrink: 0 }}>
-                {confirmDeleteEp === ep.episode_id ? (
-                  <ConfirmInline
-                    label="Delete?"
-                    onConfirm={() => deleteEpisode(ep.episode_id)}
-                    onCancel={() => setConfirmDeleteEp(null)}
-                  />
-                ) : (
-                  <button
-                    onClick={e => { e.stopPropagation(); setConfirmDeleteEp(ep.episode_id); }}
-                    style={styles.deleteBtn}>✕</button>
+                {showDelete && (
+                  <div style={{ flexShrink: 0 }} onClick={e => e.stopPropagation()}>
+                    {confirmDeleteEp === ep.episode_id ? (
+                      <ConfirmInline
+                        label="Delete?"
+                        onConfirm={() => deleteEpisode(ep.episode_id)}
+                        onCancel={() => setConfirmDeleteEp(null)}
+                      />
+                    ) : (
+                      <button
+                        onClick={e => { e.stopPropagation(); setConfirmDeleteEp(ep.episode_id); }}
+                        style={styles.deleteBtn}>✕</button>
+                    )}
+                  </div>
                 )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         {/* Detail panel */}
@@ -647,6 +858,28 @@ export default function DatasetPage() {
               </div>
             </div>
 
+            {/* Postprocess panel — above trajectory so video is visible while editing */}
+            {editMeta !== null && (
+              <EditPanel
+                editMeta={editMeta}
+                autoGripperOpenT={autoGripperOpenT}
+                episodeId={selectedId!}
+                take={selectedTake!}
+                currentTime={currentTime}
+                duration={duration}
+                onSave={meta => {
+                  saveEditMeta(meta);
+                  // update has_postprocess flag locally
+                  const hasAny = meta.trim.enabled || meta.mask.enabled;
+                  setEpisodes(prev => prev.map(e =>
+                    e.episode_id === selectedId ? { ...e, has_postprocess: hasAny } : e
+                  ));
+                  setSelected(prev => prev?.episode_id === selectedId
+                    ? { ...prev, has_postprocess: hasAny } : prev);
+                }}
+              />
+            )}
+
             {/* Trajectory views */}
             {(trajectoryData || trajLoading) && (
               <div style={{ marginTop: 14 }}>
@@ -690,6 +923,488 @@ export default function DatasetPage() {
   );
 }
 
+// ── EditPanel ─────────────────────────────────────────────────────────────
+
+function EditPanel({
+  editMeta, autoGripperOpenT, episodeId, take, currentTime, duration, onSave,
+}: {
+  editMeta: EditMeta;
+  autoGripperOpenT: number | null;
+  episodeId: string;
+  take: string;
+  currentTime: number;
+  duration?: number;
+  onSave: (m: EditMeta) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [trim, setTrim] = React.useState(editMeta.trim);
+  const [mask, setMask] = React.useState(editMeta.mask);
+  const [dirty, setDirty] = React.useState(false);
+
+  // editMeta prop이 바뀌면(take 전환) 로컬 상태 동기화
+  React.useEffect(() => { setTrim(editMeta.trim); setMask(editMeta.mask); setDirty(false); }, [editMeta]);
+
+  const effectiveCutT = trim.cut_t ?? autoGripperOpenT;
+  const trimEnd = effectiveCutT !== null ? effectiveCutT + trim.margin : null;
+
+  const save = () => { onSave({ trim, mask }); setDirty(false); };
+
+  return (
+    <div style={{ marginTop: 16, border: "1px solid #e2e8f0", borderRadius: 8, overflow: "hidden" }}>
+      {/* 헤더 */}
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "8px 12px", background: "#f8fafc", border: "none", cursor: "pointer",
+          fontSize: 12, fontWeight: 700, color: "#475569" }}
+      >
+        <span>✂ Export 편집 옵션</span>
+        <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          {trim.enabled && <span style={{ background: "#dbeafe", color: "#1d4ed8", borderRadius: 4, padding: "1px 6px" }}>Trim ON</span>}
+          {mask.enabled && <span style={{ background: "#d1fae5", color: "#065f46", borderRadius: 4, padding: "1px 6px" }}>Mask ON</span>}
+          {dirty && <span style={{ color: "#ef4444", fontSize: 10 }}>●</span>}
+          <span>{open ? "▲" : "▼"}</span>
+        </span>
+      </button>
+
+      {open && (
+        <div style={{ padding: "12px 14px", background: "#fff" }}>
+          {/* ── Trim Editor ── */}
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase" as const, letterSpacing: 0.7, marginBottom: 8 }}>
+              1. Trim (그리퍼 열림 지점 기준 자르기)
+            </div>
+
+            {/* 감지 정보 */}
+            <div style={{ background: "#f1f5f9", borderRadius: 6, padding: "6px 10px", fontSize: 12, color: "#374151", marginBottom: 8 }}>
+              {autoGripperOpenT !== null
+                ? <>자동 감지: <strong>t = {autoGripperOpenT.toFixed(2)}s</strong> (10초 이후 첫 gripper open)</>
+                : <span style={{ color: "#94a3b8" }}>그리퍼 열림 전환 감지 안 됨 (teach 데이터 없거나 10초 이내)</span>}
+            </div>
+
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 8, cursor: "pointer" }}>
+              <input type="checkbox" checked={trim.enabled}
+                onChange={e => { setTrim(p => ({ ...p, enabled: e.target.checked })); setDirty(true); }} />
+              trim 활성화
+            </label>
+
+            {trim.enabled && (
+              <>
+                {/* cut_t 수동 override */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>Gripper open t (s):</span>
+                  <input
+                    type="number" step="0.1" min={0}
+                    placeholder={autoGripperOpenT !== null ? autoGripperOpenT.toFixed(2) : "auto"}
+                    value={trim.cut_t ?? ""}
+                    onChange={e => {
+                      const v = e.target.value === "" ? null : parseFloat(e.target.value);
+                      setTrim(p => ({ ...p, cut_t: v }));
+                      setDirty(true);
+                    }}
+                    style={{ width: 80, padding: "3px 6px", borderRadius: 5, border: "1px solid #cbd5e1", fontSize: 12 }}
+                  />
+                  {trim.cut_t !== null && (
+                    <button onClick={() => { setTrim(p => ({ ...p, cut_t: null })); setDirty(true); }}
+                      style={{ fontSize: 11, color: "#6366f1", background: "none", border: "none", cursor: "pointer" }}>
+                      ↺ auto
+                    </button>
+                  )}
+                </div>
+
+                {/* margin 슬라이더 */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>여유 마진:</span>
+                  <input type="range" min={0} max={3} step={0.1}
+                    value={trim.margin}
+                    onChange={e => { setTrim(p => ({ ...p, margin: parseFloat(e.target.value) })); setDirty(true); }}
+                    style={{ flex: 1, accentColor: "#6366f1" }} />
+                  <span style={{ fontSize: 12, fontWeight: 700, color: "#6366f1", minWidth: 32 }}>{trim.margin.toFixed(1)}s</span>
+                </div>
+
+                {/* 최종 trim 시각 표시 */}
+                {(() => {
+                  const overDuration = trimEnd !== null && duration !== undefined && trimEnd > duration;
+                  return (
+                    <div style={{ fontSize: 12, borderRadius: 5, padding: "4px 8px", marginBottom: 6,
+                      background: overDuration ? "#fff7ed" : "#eef2ff",
+                      border: overDuration ? "1px solid #fed7aa" : "none" }}>
+                      <div>
+                        최종 컷: {trimEnd !== null
+                          ? <strong style={{ color: overDuration ? "#c2410c" : "#1d4ed8" }}>{trimEnd.toFixed(2)}s</strong>
+                          : "—"}
+                        {effectiveCutT !== null && (
+                          <span style={{ color: "#94a3b8" }}> ({effectiveCutT.toFixed(2)} + {trim.margin.toFixed(1)}s)</span>
+                        )}
+                      </div>
+                      {duration !== undefined && (
+                        <div style={{ marginTop: 2, color: overDuration ? "#c2410c" : "#94a3b8" }}>
+                          {overDuration
+                            ? `⚠ 영상 길이 ${duration.toFixed(1)}s 초과 → trim 효과 없음`
+                            : `영상 길이: ${duration.toFixed(1)}s`}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* 컷 지점 webcam_1 프레임 미리보기 (joint 시간 기준) */}
+                {trimEnd !== null && (
+                  <div>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>
+                      컷 지점 프레임 (joint t={trimEnd.toFixed(2)}s):
+                    </div>
+                    <Webcam1Frame episodeId={episodeId} take={take} tSec={trimEnd} ref="joint" />
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* ── Mask Editor ── */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase" as const, letterSpacing: 0.7, marginBottom: 8 }}>
+              2. Mask (cam_webcam_1 keep 영역)
+            </div>
+
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 8, cursor: "pointer" }}>
+              <input type="checkbox" checked={mask.enabled}
+                onChange={e => { setMask(p => ({ ...p, enabled: e.target.checked })); setDirty(true); }} />
+              mask 활성화
+            </label>
+
+            {mask.enabled && (
+              <MaskPolygonEditor
+                episodeId={episodeId}
+                take={take}
+                currentTime={currentTime}
+                mask={mask}
+                onMaskChange={m => { setMask(m); setDirty(true); }}
+              />
+            )}
+          </div>
+
+          {/* 저장 버튼 */}
+          <button
+            onClick={save}
+            disabled={!dirty}
+            style={{ padding: "6px 18px", background: dirty ? "#6366f1" : "#e2e8f0",
+              color: dirty ? "#fff" : "#94a3b8", border: "none", borderRadius: 6,
+              fontSize: 13, fontWeight: 700, cursor: dirty ? "pointer" : "default" }}
+          >
+            {dirty ? "저장" : "저장됨"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Shared webcam_1 frame preview ────────────────────────────────────────
+
+function Webcam1Frame({
+  episodeId, take, tSec, tBase = "camera", style,
+}: { episodeId: string; take: string; tSec: number; tBase?: "joint" | "camera"; style?: React.CSSProperties }) {
+  const [url, setUrl] = React.useState("");
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  React.useEffect(() => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      setUrl(`/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${tSec.toFixed(2)}&ref=${tBase}&_=${Date.now()}`);
+    }, 200);
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, [episodeId, take, tSec, tBase]);
+
+  if (!url) return null;
+  return (
+    <img src={url} alt={`webcam_1 @${tSec.toFixed(1)}s`}
+      style={{ width: "100%", borderRadius: 5, display: "block", background: "#000", ...style }} />
+  );
+}
+
+// ── Mask Polygon Editor ───────────────────────────────────────────────────
+
+function MaskPolygonEditor({
+  episodeId, take, currentTime, mask, onMaskChange,
+}: {
+  episodeId: string;
+  take: string;
+  currentTime: number;
+  mask: MaskMeta;
+  onMaskChange: (m: MaskMeta) => void;
+}) {
+  const polygon = mask.polygon;
+  const [showMask, setShowMask] = React.useState(true);
+  const [library, setLibrary] = React.useState<MaskLibraryEntry[]>([]);
+  const [saveName, setSaveName] = React.useState("");
+  const [showLib, setShowLib] = React.useState(false);
+
+  const loadLibrary = React.useCallback(() => {
+    fetch("/api/masks").then(r => r.json()).then(setLibrary).catch(() => {});
+  }, []);
+  React.useEffect(() => { if (showLib) loadLibrary(); }, [showLib, loadLibrary]);
+
+  const saveToLibrary = () => {
+    if (polygon.length < 3 || !saveName.trim()) return;
+    fetch("/api/masks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: saveName.trim(), polygon, source_episode: episodeId, source_take: take }),
+    }).then(r => r.json()).then(entry => {
+      setLibrary(prev => [...prev, entry]);
+      setSaveName("");
+    }).catch(() => {});
+  };
+
+  // 프레임 캡쳐 마스크: 캡쳐 기준 프레임 URL
+  const captureFrameUrl = React.useMemo(() => {
+    if (mask.fill !== "frame_capture" || mask.capture_t === undefined) return "";
+    return `/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${mask.capture_t.toFixed(2)}`;
+  }, [episodeId, take, mask.fill, mask.capture_t]);
+
+  const deleteFromLibrary = (id: string) => {
+    fetch(`/api/masks/${id}`, { method: "DELETE" })
+      .then(() => setLibrary(prev => prev.filter(e => e.id !== id)))
+      .catch(() => {});
+  };
+
+  const handleSvgClick = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    onMaskChange({ ...mask, polygon: [...polygon, [x, y] as [number, number]] });
+  };
+
+  const removePoint = (i: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    onMaskChange({ ...mask, polygon: polygon.filter((_, idx) => idx !== i) });
+  };
+
+  const outsidePath = polygon.length >= 3
+    ? `M0 0 L1 0 L1 1 L0 1 Z M${polygon.map(([x, y]) => `${x} ${y}`).join(" L")} Z`
+    : null;
+
+  return (
+    <div>
+      {/* 마스크 타입 선택 */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+        {(["black", "frame_capture"] as const).map(type => (
+          <button key={type}
+            onClick={() => onMaskChange({ ...mask, fill: type })}
+            style={{
+              padding: "4px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: "pointer",
+              border: `2px solid ${mask.fill === type ? "#6366f1" : "#e2e8f0"}`,
+              background: mask.fill === type ? "#eef2ff" : "#fff",
+              color: mask.fill === type ? "#4338ca" : "#64748b",
+            }}>
+            {type === "black" ? "🖤 검정 마스크" : "📷 프레임 캡쳐 마스크"}
+          </button>
+        ))}
+      </div>
+
+      {/* 프레임 캡쳐 타입: 캡쳐 시각 설정 */}
+      {mask.fill === "frame_capture" && (
+        <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 6, padding: "8px 10px", marginBottom: 8 }}>
+          <div style={{ fontSize: 11, color: "#166534", marginBottom: 6 }}>
+            외부 = 캡쳐 프레임 고정 · 내부(keep 영역) = 원본 비디오
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 12, color: "#374151" }}>
+              캡쳐 기준: {mask.capture_t !== undefined
+                ? <strong>{mask.capture_t.toFixed(2)}s</strong>
+                : <em style={{ color: "#94a3b8" }}>미설정</em>}
+            </span>
+            <button
+              onClick={() => onMaskChange({ ...mask, capture_t: currentTime })}
+              style={{ padding: "3px 10px", borderRadius: 5, border: "none", fontSize: 11, fontWeight: 700,
+                background: "#16a34a", color: "#fff", cursor: "pointer" }}>
+              현재 프레임으로 캡쳐 ({currentTime.toFixed(2)}s)
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 6 }}>
+        SVG 클릭 → 꼭짓점 추가 · 점 클릭 → 제거
+      </div>
+
+      {/* 프레임 + SVG 오버레이 (실제 export 결과 미리보기) */}
+      <div style={{ position: "relative", background: "#000", borderRadius: 6, overflow: "hidden", marginBottom: 8 }}>
+        {/* 레이어 1: 현재 프레임 (keep 영역의 실제 비디오) */}
+        <Webcam1Frame episodeId={episodeId} take={take} tSec={currentTime}
+          style={{ opacity: showMask && mask.fill === "black" ? 0.6 : 1 }} />
+
+        {/* 레이어 2 + 3: SVG — 마스크 미리보기 + 폴리곤 편집 */}
+        <svg viewBox="0 0 1 1" preserveAspectRatio="none"
+          style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", cursor: "crosshair" }}
+          onClick={handleSvgClick}
+        >
+          {showMask && outsidePath && (
+            mask.fill === "frame_capture" && captureFrameUrl ? (
+              // 프레임 캡쳐 타입: 캡쳐 프레임을 외부 영역에만 렌더링 (evenodd clipPath)
+              <>
+                <defs>
+                  <clipPath id="cp-mask-outside" clipPathUnits="userSpaceOnUse">
+                    <path d={outsidePath} clipRule="evenodd" />
+                  </clipPath>
+                </defs>
+                <image
+                  href={captureFrameUrl}
+                  x="0" y="0" width="1" height="1"
+                  preserveAspectRatio="none"
+                  clipPath="url(#cp-mask-outside)"
+                />
+              </>
+            ) : mask.fill === "black" ? (
+              // 검정 마스크: 외부 영역 검정 반투명
+              <path d={outsidePath} fill="rgba(0,0,0,0.55)" fillRule="evenodd" />
+            ) : null
+          )}
+          {polygon.length >= 2 && (
+            <polygon points={polygon.map(([x, y]) => `${x},${y}`).join(" ")}
+              fill="none" stroke="#22c55e" strokeWidth="0.004" />
+          )}
+          {polygon.map(([x, y], i) => (
+            <circle key={i} cx={x} cy={y} r="0.018"
+              fill="#22c55e" stroke="#fff" strokeWidth="0.005"
+              style={{ cursor: "pointer" }}
+              onClick={e => removePoint(i, e as unknown as React.MouseEvent)} />
+          ))}
+        </svg>
+
+        {currentTime === 0 && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center",
+            justifyContent: "center", color: "#94a3b8", fontSize: 11, pointerEvents: "none" }}>
+            비디오 재생 후 원하는 시점 정지 → 프레임 표시
+          </div>
+        )}
+      </div>
+
+      {/* 컨트롤 */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" as const, alignItems: "center", marginBottom: 8 }}>
+        <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: "#475569" }}>
+          <input type="checkbox" checked={showMask} onChange={e => setShowMask(e.target.checked)} />
+          마스크 미리보기
+        </label>
+        <button onClick={() => onMaskChange({ ...mask, polygon: polygon.slice(0, -1) })} disabled={polygon.length === 0}
+          style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, border: "1px solid #e2e8f0", background: "#fff", color: "#374151", cursor: "pointer" }}>
+          마지막 점 제거
+        </button>
+        <button onClick={() => onMaskChange({ ...mask, polygon: [] })}
+          style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, border: "1px solid #e2e8f0", background: "#fff", color: "#ef4444", cursor: "pointer" }}>
+          초기화
+        </button>
+        <span style={{ fontSize: 11, color: "#94a3b8" }}>{polygon.length}개 꼭짓점</span>
+      </div>
+
+      {/* 마스크 라이브러리 */}
+      <div style={{ border: "1px solid #e2e8f0", borderRadius: 6, overflow: "hidden" }}>
+        <button onClick={() => setShowLib(v => !v)}
+          style={{ width: "100%", padding: "6px 10px", background: "#f8fafc", border: "none",
+            cursor: "pointer", fontSize: 11, fontWeight: 700, color: "#475569",
+            display: "flex", justifyContent: "space-between" }}>
+          <span>📚 마스크 라이브러리</span>
+          <span>{showLib ? "▲" : "▼"}</span>
+        </button>
+        {showLib && (
+          <div style={{ padding: "8px 10px" }}>
+            <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+              <input type="text" placeholder="마스크 이름…" value={saveName}
+                onChange={e => setSaveName(e.target.value)}
+                style={{ flex: 1, padding: "3px 7px", borderRadius: 5, border: "1px solid #cbd5e1", fontSize: 11 }} />
+              <button onClick={saveToLibrary} disabled={polygon.length < 3 || !saveName.trim()}
+                style={{ padding: "3px 10px", borderRadius: 5, border: "none", fontSize: 11, fontWeight: 700,
+                  background: polygon.length >= 3 && saveName.trim() ? "#6366f1" : "#e2e8f0",
+                  color: polygon.length >= 3 && saveName.trim() ? "#fff" : "#94a3b8", cursor: "pointer" }}>
+                저장
+              </button>
+            </div>
+            {library.length === 0
+              ? <div style={{ fontSize: 11, color: "#94a3b8", textAlign: "center", padding: "8px 0" }}>저장된 마스크 없음</div>
+              : library.map(entry => (
+                <div key={entry.id}
+                  style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 0",
+                    borderBottom: "1px solid #f1f5f9", fontSize: 11 }}>
+                  <button onClick={() => onMaskChange({ ...mask, polygon: entry.polygon as [number, number][] })}
+                    style={{ flex: 1, textAlign: "left", background: "none", border: "none",
+                      cursor: "pointer", color: "#1d4ed8", fontWeight: 600, fontSize: 11 }}>
+                    {entry.name}
+                  </button>
+                  <span style={{ color: "#94a3b8", fontSize: 10 }}>
+                    {entry.polygon.length}pts · {entry.created_at}
+                  </span>
+                  {entry.source_episode && (
+                    <span style={{ color: "#94a3b8", fontSize: 10 }}>{entry.source_episode.slice(-12)}</span>
+                  )}
+                  <button onClick={() => deleteFromLibrary(entry.id)}
+                    style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 12 }}>✕</button>
+                </div>
+              ))
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Export Modal ──────────────────────────────────────────────────────────
+
+function ExportModal({ count, exporting, exportingLerobot, includeFrames, onIncludeFrames, onExportZip, onExportLerobot, onClose }: {
+  count: number;
+  exporting: boolean;
+  exportingLerobot: boolean;
+  includeFrames: boolean;
+  onIncludeFrames: (v: boolean) => void;
+  onExportZip: () => void;
+  onExportLerobot: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000,
+      display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={onClose}>
+      <div style={{ background: "#fff", borderRadius: 12, padding: "24px 28px", minWidth: 320,
+        boxShadow: "0 20px 40px rgba(0,0,0,0.15)" }}
+        onClick={e => e.stopPropagation()}>
+        <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 700, color: "#1e293b" }}>
+          Export Dataset
+        </h3>
+        <div style={{ fontSize: 13, color: "#64748b", marginBottom: 16 }}>
+          {count}개 에피소드 선택됨
+        </div>
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#374151", cursor: "pointer", marginBottom: 20 }}>
+          <input type="checkbox" checked={includeFrames} onChange={e => onIncludeFrames(e.target.checked)} />
+          Raw 프레임 이미지 포함 (용량 큼)
+        </label>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <button onClick={() => { onExportZip(); onClose(); }} disabled={exporting}
+            style={{ padding: "10px 16px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700,
+              background: "#6366f1", color: "#fff", cursor: "pointer", textAlign: "left" }}>
+            {exporting ? "압축 중…" : "↓ Basic ZIP (원본 형식)"}
+            <div style={{ fontSize: 10, fontWeight: 400, opacity: 0.8, marginTop: 2 }}>CSV + 비디오 + 메타데이터</div>
+          </button>
+          <button onClick={() => { onExportLerobot(); onClose(); }} disabled={exportingLerobot}
+            style={{ padding: "10px 16px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700,
+              background: "#059669", color: "#fff", cursor: "pointer", textAlign: "left" }}>
+            {exportingLerobot ? "변환 중…" : "↓ LeRobot v2.0 ZIP"}
+            <div style={{ fontSize: 10, fontWeight: 400, opacity: 0.8, marginTop: 2 }}>224×224 @ 15fps · parquet · postprocess 적용</div>
+          </button>
+        </div>
+
+        <button onClick={onClose}
+          style={{ marginTop: 16, width: "100%", padding: "8px", borderRadius: 8, border: "1px solid #e5e7eb",
+            background: "#fff", fontSize: 12, color: "#64748b", cursor: "pointer" }}>
+          취소
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function StatusBadge({ success }: { success: boolean | null | undefined }) {
   if (success === null || success === undefined)
     return <span style={{ ...styles.badge, background: "#f1f5f9", color: "#6b7280" }}>?</span>;
@@ -725,16 +1440,16 @@ const styles: Record<string, React.CSSProperties> = {
   },
   empty: { color: "#9ca3af", fontSize: 13, padding: "24px 0", textAlign: "center" },
   epRow: {
-    display: "flex", alignItems: "center", gap: 10,
-    padding: "9px 11px", borderRadius: 8, border: "1px solid #e5e7eb",
-    cursor: "pointer",
+    display: "flex", alignItems: "center", gap: 8,
+    padding: "6px 10px", borderRadius: 8, border: "1px solid #e5e7eb",
+    cursor: "pointer", minHeight: 52,
   },
-  epId: { fontFamily: "monospace", fontSize: 11, color: "#6366f1", fontWeight: 700 },
+  epId: { fontFamily: "monospace", fontSize: 10, color: "#6366f1", fontWeight: 700 },
   epTask: {
-    fontSize: 12, color: "#374151", marginTop: 1,
+    fontSize: 11, color: "#374151", marginTop: 1,
     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
   },
-  epMeta: { display: "flex", alignItems: "center", gap: 8, marginTop: 3 },
+  epMeta: { display: "flex", alignItems: "center", gap: 6, marginTop: 2 },
   metaText: { fontSize: 10, color: "#9ca3af" },
   badge: { padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700 },
   deleteBtn: {
@@ -787,5 +1502,25 @@ const styles: Record<string, React.CSSProperties> = {
   editBtn: {
     background: "none", border: "none", cursor: "pointer",
     fontSize: 13, color: "#94a3b8", padding: "0 2px", lineHeight: 1,
+  },
+  checkbox: {
+    width: 15, height: 15, flexShrink: 0, cursor: "pointer", accentColor: "#6366f1",
+  },
+  exportBar: {
+    display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" as const,
+    padding: "8px 14px", background: "#eef2ff", borderRadius: 8,
+    border: "1px solid #c7d2fe", marginBottom: 10,
+  },
+  bulkTaskRow: {
+    display: "flex", alignItems: "center", gap: 4,
+  },
+  bulkTaskInput: {
+    padding: "4px 8px", borderRadius: 6, fontSize: 12,
+    border: "1px solid #a5b4fc", outline: "none", width: 240,
+  },
+  exportBarBtn: {
+    padding: "5px 14px", background: "#6366f1", color: "#fff",
+    border: "none", borderRadius: 6, fontSize: 12, fontWeight: 700,
+    cursor: "pointer",
   },
 };

@@ -122,6 +122,7 @@ export interface Episode {
   takes: EpisodeTake[];
   takes_count: number;
   size_mb?: number;
+  has_postprocess?: boolean;  // 마지막 take에 활성화된 postprocess 편집이 있는지
   // 구버전 호환
   stats?: Record<string, number>;
   checklist?: Record<string, boolean>;
@@ -150,4 +151,31 @@ export interface TakeTrajectoryData {
   teach: EESample[];
   executed: EESample[];
   command: EESample[];
+}
+
+export interface TrimMeta {
+  enabled: boolean;
+  cut_t: number | null;   // gripper open 시각 (null = 자동 감지)
+  margin: number;          // gripper open 이후 추가 유지 시간(초)
+}
+
+export interface MaskMeta {
+  enabled: boolean;
+  polygon: [number, number][];  // normalized 0-1 좌표 (keep 영역 폴리곤)
+  fill: "black" | "frame_capture";
+  capture_t?: number;  // frame_capture 타입: 캡쳐 기준 시각(초)
+}
+
+export interface EditMeta {
+  trim: TrimMeta;
+  mask: MaskMeta;
+}
+
+export interface MaskLibraryEntry {
+  id: string;
+  name: string;
+  polygon: [number, number][];
+  created_at: string;
+  source_episode?: string;
+  source_take?: string;
 }

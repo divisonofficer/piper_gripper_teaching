@@ -65,6 +65,12 @@ def return_home():
     return jsonify(_ctrl().return_home())
 
 
+@bp.post("/home/direct")
+def return_home_direct():
+    """역방향 궤적 없이 safe waypoints로 바로 홈 복귀."""
+    return jsonify(_ctrl().return_home_direct())
+
+
 @bp.post("/replay/start")
 def replay_start():
     data = request.get_json(silent=True) or {}

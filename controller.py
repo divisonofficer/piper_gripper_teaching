@@ -72,7 +72,7 @@ _AVAILABLE_ACTIONS: dict[State, list[str]] = {
     State.CALIBRATING:      ["stop_calibration", "hold_position"],
     State.TEACH_READY:      ["start_teach", "calibrate", "open_gripper", "close_gripper"],
     State.TEACH_RECORDING:  ["stop_teach", "open_gripper", "close_gripper", "hold_position"],
-    State.TRAJECTORY_CHECK: ["return_home", "discard_episode"],
+    State.TRAJECTORY_CHECK: ["return_home", "return_home_direct", "discard_episode"],
     State.RETURN_HOME:      ["hold_position"],
     State.REPLAY_READY:     ["start_replay", "discard_episode", "open_gripper", "close_gripper"],
     State.REPLAY_RECORDING: ["stop_replay", "hold_position", "open_gripper", "close_gripper", "gripper_set"],
@@ -324,11 +324,30 @@ class Controller:
         ok = self._piper.safe_return_to_start(
             trajectory=self._smoothed_trajectory,
             done_callback=self._on_home_reached,
+            abort_callback=self._on_home_abort,
         )
         if not ok:
             self._add_event_log("safe_return_to_start refused — reverting to TRAJECTORY_CHECK")
             self._set_state(State.TRAJECTORY_CHECK)
             return {"ok": False, "reason": "safe_return_to_start refused"}
+
+        return {"ok": True}
+
+    def return_home_direct(self) -> dict:
+        """역방향 궤적 없이 SAFE_RETURN_WAYPOINTS 경유로 바로 홈 복귀."""
+        if self.get_state() != State.TRAJECTORY_CHECK:
+            return {"ok": False, "reason": "Must be in TRAJECTORY_CHECK state"}
+        if self._piper is None:
+            return {"ok": False, "reason": "Robot not connected"}
+
+        self._set_state(State.RETURN_HOME)
+        self._add_event_log("Returning home directly via safe waypoints (no backtrace)")
+
+        ok = self._piper.go_to_safe_ready(done_callback=self._on_home_reached, abort_callback=self._on_home_abort)
+        if not ok:
+            self._add_event_log("go_to_safe_ready refused — reverting to TRAJECTORY_CHECK")
+            self._set_state(State.TRAJECTORY_CHECK)
+            return {"ok": False, "reason": "SAFE_RETURN_WAYPOINTS not configured. Set them in the Setup page first."}
 
         return {"ok": True}
 
@@ -362,6 +381,11 @@ class Controller:
 
         self._add_event_log("Robot reached start position")
         self._set_state(State.REPLAY_READY)
+
+    def _on_home_abort(self):
+        """홈 복귀 실패(waypoint timeout) — TRAJECTORY_CHECK로 복귀해 재시도 허용."""
+        self._add_event_log("Return home failed (timeout) — reverted to TRAJECTORY_CHECK. Retry or discard.")
+        self._set_state(State.TRAJECTORY_CHECK)
 
     def _is_at_trajectory_start(self, tol: float = 0.06) -> tuple:
         """현재 위치가 trajectory 시작점에 충분히 가까운지 확인."""
@@ -502,7 +526,25 @@ class Controller:
         if self._piper:
             self._piper.clear_events()
             self._piper.clear_gripper_close_arm_pos()
-        self._set_state(State.TEACH_READY)
+
+        # 로봇이 연결되어 있으면 safe_ready 위치로 복귀 후 TEACH_READY
+        def _on_home():
+            self._add_event_log("Robot at safe ready pose — ready for new episode")
+            self._set_state(State.TEACH_READY)
+
+        def _on_home_abort():
+            self._add_event_log("Return home failed — reverted to TEACH_READY")
+            self._set_state(State.TEACH_READY)
+
+        if self._piper:
+            self._set_state(State.RETURN_HOME)
+            ok = self._piper.go_to_safe_ready(done_callback=_on_home, abort_callback=_on_home_abort)
+            if not ok:
+                self._add_event_log("SAFE_RETURN_WAYPOINTS not configured — skipping home move")
+                self._set_state(State.TEACH_READY)
+        else:
+            self._set_state(State.TEACH_READY)
+
         return {"ok": True}
 
     def retake_replay(self) -> dict:
@@ -546,11 +588,14 @@ class Controller:
             self._add_event_log("Robot at safe ready pose — ready to re-teach")
             self._set_state(State.TEACH_READY)
 
+        def _on_home_for_teach_abort():
+            self._add_event_log("Return home failed — reverted to TEACH_READY. Manually move robot before teaching.")
+            self._set_state(State.TEACH_READY)
+
         if self._piper:
             self._set_state(State.RETURN_HOME)
-            ok = self._piper.go_to_safe_ready(done_callback=_on_home_for_teach)
+            ok = self._piper.go_to_safe_ready(done_callback=_on_home_for_teach, abort_callback=_on_home_for_teach_abort)
             if not ok:
-                # SAFE_RETURN_WAYPOINTS 미설정: 이동 없이 TEACH_READY (callback 호출 금지)
                 self._add_event_log(
                     "SAFE_RETURN_WAYPOINTS not configured — manual reset required before re-teaching"
                 )
@@ -575,11 +620,14 @@ class Controller:
             self._add_event_log("Robot at safe ready pose — ready for new take")
             self._set_state(State.TEACH_READY)
 
+        def _on_home_for_new_take_abort():
+            self._add_event_log("Return home failed — reverted to TEACH_READY. Manually move robot before new take.")
+            self._set_state(State.TEACH_READY)
+
         if self._piper:
             self._set_state(State.RETURN_HOME)
-            ok = self._piper.go_to_safe_ready(done_callback=_on_home_for_teach)
+            ok = self._piper.go_to_safe_ready(done_callback=_on_home_for_teach, abort_callback=_on_home_for_new_take_abort)
             if not ok:
-                # SAFE_RETURN_WAYPOINTS 미설정: 이동 없이 TEACH_READY (callback 호출 금지)
                 self._add_event_log(
                     "SAFE_RETURN_WAYPOINTS not configured — manual reset required before new take"
                 )

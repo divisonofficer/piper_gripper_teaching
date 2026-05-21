@@ -49,7 +49,13 @@ export default function App() {
     const s = socketRef.current;
 
     s.on("mode_change", (data: ModeChangePayload) => {
-      setMode(data.mode);
+      setMode(prev => {
+        // SAVED/DISCARDED → RETURN_HOME → TEACH_READY 흐름 감지: capture 페이지로 이동
+        if (data.mode === "TEACH_READY" && (prev === "SAVED" || prev === "DISCARDED" || prev === "RETURN_HOME")) {
+          setPage("capture");
+        }
+        return data.mode;
+      });
       setNextAction(data.next_action);
       setAvailableActions(data.available_actions);
       // PROCESSING 진입 시 review 페이지로 전환 + 스텝 초기화

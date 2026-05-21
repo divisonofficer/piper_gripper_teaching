@@ -62,7 +62,7 @@ export default function CapturePage({
 }: Props) {
   const [selectedCam, setSelectedCam] = useState<CamId>("realsense");
   const [task, setTask] = useState("pick red block and place in bowl");
-  const [speedScale, setSpeedScale] = useState(0.3);
+  const [speedScale, setSpeedScale] = useState(0.5);
   const [confirmReplay, setConfirmReplay] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [calibLimits, setCalibLimits] = useState<Record<
@@ -77,7 +77,8 @@ export default function CapturePage({
   const handleReady       = () => post("/api/ready");
   const handleStartTeach  = () => post("/api/teach/start", { task });
   const handleStopTeach   = () => { setIsSaving(true); post("/api/teach/stop"); };
-  const handleReturnHome  = () => post("/api/home");
+  const handleReturnHome       = () => post("/api/home");
+  const handleReturnHomeDirect = () => post("/api/home/direct");
   const handleStartReplay = () => {
     setConfirmReplay(false);
     post("/api/replay/start", { speed_scale: speedScale });
@@ -221,7 +222,7 @@ export default function CapturePage({
             <>
               <Btn label="Confirm Ready Pose" onClick={handleReady} primary disabled={!can("confirm_ready_pose")} />
               <Btn label="Calibrate Joint Range" onClick={handleCalibStart} disabled={!can("calibrate")} />
-              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} />
+              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} gripperRad={robot.gripper} />
               {calibLimits && <CalibResultPanel limits={calibLimits} />}
             </>
           )}
@@ -237,21 +238,22 @@ export default function CapturePage({
             <>
               <Btn label="Start Teaching" onClick={handleStartTeach} primary disabled={!can("start_teach") || !task.trim()} />
               <Btn label="Calibrate Joint Range" onClick={handleCalibStart} disabled={!can("calibrate")} />
-              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} />
+              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} gripperRad={robot.gripper} />
               {calibLimits && <CalibResultPanel limits={calibLimits} />}
             </>
           )}
 
           {mode === "TEACH_RECORDING" && (
             <>
-              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} />
+              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} gripperRad={robot.gripper} />
               <Btn label="Stop Teaching" onClick={handleStopTeach} primary disabled={!can("stop_teach")} />
             </>
           )}
 
           {mode === "TRAJECTORY_CHECK" && (
             <>
-              <Btn label="Return to Home" onClick={handleReturnHome} primary disabled={!can("return_home")} />
+              <Btn label="↩ Return (Backtrace)" onClick={handleReturnHome} primary disabled={!can("return_home")} />
+              <Btn label="⚡ Return Direct" onClick={handleReturnHomeDirect} disabled={!can("return_home_direct")} />
               <Btn label="Discard & Retake" onClick={handleDiscard} disabled={!can("discard_episode")} />
             </>
           )}
@@ -276,14 +278,14 @@ export default function CapturePage({
                   </div>
                 </div>
               )}
-              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} />
+              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} gripperRad={robot.gripper} />
               <Btn label="Discard & Retake" onClick={handleDiscard} disabled={!can("discard_episode")} />
             </>
           )}
 
           {mode === "REPLAY_RECORDING" && (
             <>
-              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} />
+              <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} gripperRad={robot.gripper} />
               <Btn label="Stop Recording" onClick={handleStopReplay} primary disabled={!can("stop_replay")} />
             </>
           )}
@@ -371,16 +373,35 @@ const teachStyles: Record<string, React.CSSProperties> = {
 };
 
 /**
- * GripperRow — 슬라이더(0 / 50 / 100%) 즉시 전송
+ * GripperRow — 슬라이더(0 / 100%) 즉시 전송 (50% 단계 제거)
  */
+const GRIPPER_OPEN_RAD = 0.07;
+const GRIPPER_SNAPS = [0, 100];
+
+function radToSnapPct(rad: number): number {
+  const raw = Math.round((rad / GRIPPER_OPEN_RAD) * 100);
+  return GRIPPER_SNAPS.reduce((prev, curr) =>
+    Math.abs(curr - raw) < Math.abs(prev - raw) ? curr : prev
+  );
+}
+
 function GripperRow({
-  onSet, onClose, can,
-}: { onSet: (pct: number) => void; onClose: () => void; can: (a: string) => boolean }) {
-  const [pct, setPct] = React.useState(100);
+  onSet, onClose, can, gripperRad,
+}: { onSet: (pct: number) => void; onClose: () => void; can: (a: string) => boolean; gripperRad?: number }) {
+  const [pct, setPct] = React.useState(() =>
+    gripperRad !== undefined ? radToSnapPct(gripperRad) : 100
+  );
   const canOpen  = can("open_gripper");
   const canClose = can("close_gripper");
   const canAny   = canOpen || canClose || can("gripper_set");
-  const SNAPS    = [0, 50, 100];
+  const SNAPS    = GRIPPER_SNAPS;
+
+  // 실제 그리퍼 상태 반영 (슬라이더 동기화)
+  useEffect(() => {
+    if (gripperRad !== undefined) {
+      setPct(radToSnapPct(gripperRad));
+    }
+  }, [gripperRad]);
 
   const handleChange = (val: number) => {
     setPct(val);
@@ -393,7 +414,7 @@ function GripperRow({
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <input
           type="range"
-          min={0} max={100} step={50}
+          min={0} max={100} step={100}
           value={pct}
           disabled={!canAny}
           onChange={e => handleChange(Number(e.target.value))}

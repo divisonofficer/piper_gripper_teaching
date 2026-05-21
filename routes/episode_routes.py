@@ -49,7 +49,27 @@ def _take_dir(episode_id: str, take: Optional[str] = None) -> Optional[str]:
 
 @bp.get("")
 def list_episodes():
-    return jsonify(_mgr().list_episodes())
+    from config import DATASET_PATH
+    episodes = _mgr().list_episodes()
+    # 각 에피소드의 마지막 take edit_meta.json 확인 → has_postprocess 플래그
+    for ep in episodes:
+        ep_id = ep.get("episode_id", "")
+        takes_dir = os.path.join(DATASET_PATH, ep_id, "takes")
+        has_pp = False
+        if os.path.isdir(takes_dir):
+            take_names = sorted(d for d in os.listdir(takes_dir)
+                                if os.path.isdir(os.path.join(takes_dir, d)))
+            if take_names:
+                em_path = os.path.join(takes_dir, take_names[-1], "edit_meta.json")
+                if os.path.exists(em_path):
+                    try:
+                        with open(em_path) as f:
+                            em = json.load(f)
+                        has_pp = bool(em.get("trim", {}).get("enabled")) or bool(em.get("mask", {}).get("enabled"))
+                    except (OSError, json.JSONDecodeError):
+                        pass
+        ep["has_postprocess"] = has_pp
+    return jsonify(episodes)
 
 
 @bp.get("/<episode_id>")
@@ -254,6 +274,229 @@ def get_take_joints(episode_id: str, take: str):
         "executed": read_joint_csv("executed_joint.csv"),
         "command": read_joint_csv("replay_command.csv"),
     })
+
+
+@bp.post("/export")
+def export_episodes():
+    from config import DATASET_PATH
+    import io, zipfile
+
+    data = request.get_json(silent=True) or {}
+    episode_ids: list[str] = data.get("episode_ids", [])
+    include_frames: bool = bool(data.get("include_frames", False))
+
+    if not episode_ids:
+        return abort(400)
+
+    from datetime import datetime, timezone
+
+    readme = _build_readme(episode_ids, include_frames)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        zf.writestr("README.txt", readme)
+        for ep_id in episode_ids:
+            ep_dir = os.path.join(DATASET_PATH, ep_id)
+            if not os.path.isdir(ep_dir):
+                continue
+            for root, dirs, files in os.walk(ep_dir):
+                if not include_frames:
+                    # Skip frame image directories (frames/, frames_webcam_0/, etc.)
+                    dirs[:] = [d for d in dirs if not d.startswith("frames")]
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    arcname = os.path.relpath(fpath, os.path.dirname(ep_dir))
+                    try:
+                        zf.write(fpath, arcname)
+                    except OSError:
+                        pass
+
+    buf.seek(0)
+    name = f"piper_dataset_{len(episode_ids)}ep.zip"
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=name)
+
+
+@bp.post("/export_lerobot")
+def export_lerobot():
+    """선택 에피소드를 LeRobot v2.0 형식 ZIP으로 변환·제공."""
+    import io, zipfile, tempfile
+    from converters.lerobot_converter import convert_episodes
+    from config import DATASET_PATH
+
+    data = request.get_json(silent=True) or {}
+    episode_ids: list[str] = data.get("episode_ids", [])
+    if not episode_ids:
+        return abort(400)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = os.path.join(tmp, "lerobot")
+        convert_episodes(episode_ids, DATASET_PATH, out_dir)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for root, _, files in os.walk(out_dir):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    arcname = os.path.relpath(fpath, tmp)
+                    try:
+                        zf.write(fpath, arcname)
+                    except OSError:
+                        pass
+        buf.seek(0)
+        name = f"piper_lerobot_{len(episode_ids)}ep.zip"
+        return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=name)
+
+
+def _build_readme(episode_ids: list[str], include_frames: bool) -> str:
+    from datetime import datetime, timezone
+    from config import DATASET_PATH
+
+    ep_lines = []
+    for ep_id in episode_ids:
+        meta_path = os.path.join(DATASET_PATH, ep_id, "meta.json")
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            task = meta.get("task", {}).get("instruction") or meta.get("task") or "—"
+            if isinstance(task, dict):
+                task = task.get("instruction", "—")
+            success = meta.get("success")
+            label = "success" if success is True else "failure" if success is False else "unlabeled"
+            takes = len(meta.get("takes", []))
+            ep_lines.append(f"  {ep_id}  [{label}]  takes={takes}  task={task}")
+        except (OSError, json.JSONDecodeError):
+            ep_lines.append(f"  {ep_id}")
+
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    frame_note = (
+        "Included: mp4 video, depth video, CSV joint logs, webcam video, raw PNG frames"
+        if include_frames else
+        "Included: mp4 video, depth video, CSV joint logs, webcam video  (raw frames excluded)"
+    )
+
+    return f"""\
+Piper Robot Arm — Demonstration Dataset
+========================================
+Exported : {exported_at}
+Episodes : {len(episode_ids)}
+{frame_note}
+
+EPISODES
+--------
+{chr(10).join(ep_lines)}
+
+DIRECTORY STRUCTURE
+-------------------
+<episode_id>/
+  meta.json                  Episode metadata (task, success label, timestamps)
+  takes/
+    take_001/
+      teach_joint.csv        Joint angles recorded during kinesthetic teaching
+      executed_joint.csv     Joint angles executed during replay
+      replay_command.csv     Joint commands sent to the robot during replay
+      video.mp4              RGB video from primary depth camera (color stream)
+      video_depth.mp4        Depth-colorised video from primary camera
+      video_webcam_0.mp4     RGB video from external webcam 0  (if available)
+      video_webcam_1.mp4     RGB video from external webcam 1  (if available)
+      frames/                Raw PNG frames — color_XXXXXX.png  (if included)
+      frames_webcam_0/       Raw PNG frames from webcam 0       (if included)
+    take_002/ ...
+
+CSV FORMAT  (teach_joint.csv / executed_joint.csv / replay_command.csv)
+-----------------------------------------------------------------------
+Column      Type     Description
+----------  -------  ---------------------------------------------------
+t_host_ns   int64    Host-side timestamp, nanoseconds since Unix epoch
+q1..q6      float    Joint angles in radians (joint 1 = base, 6 = wrist)
+gripper     float    Gripper opening in metres (0 = closed, ~0.07 = open)
+
+ROBOT
+-----
+Platform : AgileX Piper 6-DOF collaborative arm
+Kinematics: DH parameters (dh_is_offset=0x01)
+  Link  a (mm)    alpha (rad)  d (mm)
+   1      0.00    0.000        123.00
+   2      0.00   -π/2            0.00
+   3    285.03    0.000           0.00
+   4    -21.98   +π/2          250.75
+   5      0.00   -π/2            0.00
+   6      0.00   +π/2           91.00
+"""
+
+
+@bp.get("/<episode_id>/takes/<take>/frame_webcam1_at")
+def get_take_frame_webcam1_at(episode_id: str, take: str):
+    """
+    t_sec에 가장 가까운 webcam_1 프레임 반환.
+    ref=joint (기본): teach_joint.csv 기준 시각 → trim/joint 시스템과 동일한 좌표계
+    ref=camera      : camera_frames_webcam_1.csv 의 첫 프레임 기준 시각 (비디오 플레이어 시각)
+    """
+    from config import DATASET_PATH
+    t_sec = float(request.args.get("t", 0))
+    ref = request.args.get("ref", "joint")  # "joint" | "camera"
+
+    td = os.path.join(DATASET_PATH, episode_id, "takes", take)
+    frames_dir = os.path.join(td, "frames_webcam_1")
+    if not os.path.isdir(frames_dir):
+        return abort(404)
+
+    cam_csv_path = os.path.join(td, "camera_frames_webcam_1.csv")
+    frame_idx = 0
+    if os.path.exists(cam_csv_path):
+        with open(cam_csv_path) as f:
+            rows = list(csv_module.DictReader(f))
+        if rows:
+            cam_t0_ns = int(float(rows[0]["t_host_ns"]))
+            if ref == "joint":
+                # teach_joint.csv 첫 샘플의 절대 시각을 기준으로 삼음
+                joint_csv = os.path.join(td, "teach_joint.csv")
+                t0_ns = cam_t0_ns  # fallback: camera t0
+                if os.path.exists(joint_csv):
+                    with open(joint_csv) as jf:
+                        first_joint = next(csv_module.DictReader(jf), None)
+                    if first_joint:
+                        t0_ns = int(float(first_joint["t_host_ns"]))
+            else:
+                t0_ns = cam_t0_ns  # camera-relative
+
+            t_target_ns = t0_ns + int(t_sec * 1e9)
+            best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target_ns))
+            frame_idx = int(best["frame_idx"])
+
+    for ext in ("jpg", "png"):
+        path = os.path.join(frames_dir, f"color_{frame_idx:06d}.{ext}")
+        if os.path.exists(path):
+            return send_file(path, mimetype=f"image/{'jpeg' if ext == 'jpg' else ext}")
+    return abort(404)
+
+
+@bp.get("/<episode_id>/takes/<take>/edit_meta")
+def get_edit_meta(episode_id: str, take: str):
+    from config import DATASET_PATH
+    td = os.path.join(DATASET_PATH, episode_id, "takes", take)
+    if not os.path.isdir(td):
+        return abort(404)
+    path = os.path.join(td, "edit_meta.json")
+    if not os.path.exists(path):
+        return jsonify({"trim": {"enabled": False, "cut_t": None, "margin": 1.0},
+                        "mask": {"enabled": False, "polygon": [], "fill": "black"}})
+    with open(path) as f:
+        return jsonify(json.load(f))
+
+
+@bp.put("/<episode_id>/takes/<take>/edit_meta")
+def put_edit_meta(episode_id: str, take: str):
+    from config import DATASET_PATH
+    td = os.path.join(DATASET_PATH, episode_id, "takes", take)
+    if not os.path.isdir(td):
+        return abort(404)
+    data = request.get_json(silent=True)
+    if data is None:
+        return abort(400)
+    path = os.path.join(td, "edit_meta.json")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return jsonify({"ok": True})
 
 
 @bp.get("/<episode_id>/takes/<take>/trajectory")

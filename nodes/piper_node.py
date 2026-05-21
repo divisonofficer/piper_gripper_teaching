@@ -389,6 +389,51 @@ class PiperTeachReplayNode(Node):
     # Home
     # ─────────────────────────────────────────────────────────────────
 
+    def _send_until_close(
+        self,
+        wp: list,
+        velocity: float,
+        gripper: Optional[float],
+        tol: float = 0.05,
+        vel_tol: float = 0.4,
+        timeout: float = 15.0,
+        resend_hz: float = 5.0,
+    ) -> bool:
+        """
+        wp에 도달할 때까지 resend_hz 주기로 명령을 반복 전송.
+        ctrl_node의 hold 모드 race condition을 방지하기 위해 단발 전송 대신 사용.
+        """
+        t0 = time.time()
+        n = min(len(wp), DOF)
+        pos_err = float("inf")
+        max_vel = float("inf")
+        resend_interval = 1.0 / resend_hz
+        last_send = 0.0
+
+        while time.time() - t0 < timeout:
+            now = time.time()
+            if now - last_send >= resend_interval:
+                self._publish_joint_cmd(wp[:DOF], velocity=velocity, gripper=gripper)
+                last_send = now
+
+            with self._lock:
+                cur = list(self._latest_position[:DOF])
+                vel = list(self._latest_velocity[:DOF])
+            if len(cur) < n:
+                time.sleep(0.02)
+                continue
+
+            pos_err = max(abs(cur[i] - wp[i]) for i in range(n))
+            max_vel = max(abs(v) for v in vel[:n]) if vel else 0.0
+            if pos_err < tol and max_vel < vel_tol:
+                return True
+            time.sleep(0.02)
+
+        self.get_logger().warn(
+            f"_wait_until_close timeout: pos_err={pos_err:.3f}rad vel={max_vel:.3f}rad/s"
+        )
+        return False
+
     def _wait_until_close(
         self,
         target: list,
@@ -426,6 +471,7 @@ class PiperTeachReplayNode(Node):
         self,
         waypoints: list,
         done_callback: Optional[Callable] = None,
+        abort_callback: Optional[Callable] = None,
         gripper_during: Optional[float] = None,
         gripper_after: Optional[float] = None,
     ) -> bool:
@@ -433,6 +479,7 @@ class PiperTeachReplayNode(Node):
         검증된 waypoint sequence를 순서대로 실행하는 안전 복귀 primitive.
         각 waypoint 도착 실패(timeout) 시 그 자리에서 abort — 다음 waypoint로 진행하지 않는다.
         done_callback은 모든 waypoint 도착 성공 시에만 호출된다.
+        abort_callback은 waypoint timeout 실패 시에만 호출된다.
         """
         if not waypoints:
             self.get_logger().error("_follow_home_waypoints: empty waypoints — refused.")
@@ -455,15 +502,18 @@ class PiperTeachReplayNode(Node):
                     cur = list(self._latest_position[:DOF])
 
                 max_dist = max(abs(cur[i] - wp[i]) for i in range(min(DOF, len(wp))))
-                timeout = max(4.0, max_dist / 0.25 + 1.0)
+                timeout = max(6.0, max_dist / 0.15 + 3.0)
 
                 self.get_logger().info(
                     f"safe_home waypoint {idx}/{len(waypoints)-1}: "
                     f"{[round(x, 3) for x in wp]}, dist={max_dist:.3f}rad, timeout={timeout:.1f}s"
                 )
 
-                self._publish_joint_cmd(wp, velocity=HOME_VELOCITY, gripper=grip)
-                reached = self._wait_until_close(wp[:DOF], tol=0.05, timeout=timeout)
+                # 단발 명령으로는 ctrl_node hold 모드 재진입 시 무시됨 → 도달까지 반복 송신
+                reached = self._send_until_close(
+                    wp, velocity=HOME_VELOCITY, gripper=grip,
+                    tol=0.05, vel_tol=0.4, timeout=timeout,
+                )
 
                 if not reached:
                     self.get_logger().error(
@@ -471,6 +521,8 @@ class PiperTeachReplayNode(Node):
                         f"Robot stopped at current position."
                     )
                     self._log_event(f"safe_home_abort_waypoint_{idx}")
+                    if abort_callback:
+                        abort_callback()
                     return  # abort — done_callback 호출 금지
 
             if gripper_after is not None:
@@ -488,6 +540,7 @@ class PiperTeachReplayNode(Node):
         self,
         trajectory: list,
         done_callback: Optional[Callable] = None,
+        abort_callback: Optional[Callable] = None,
     ) -> bool:
         """
         recorded trajectory를 역방향으로 따라 teach_start까지 안전 복귀.
@@ -553,16 +606,18 @@ class PiperTeachReplayNode(Node):
             f"safe_return_to_start: {n} waypoints → {len(sampled)} sampled "
             f"(stride={stride}, gripper transitions={len(relevant_transitions)//2})"
         )
-        return self._execute_reverse_path(sampled, done_callback)
+        return self._execute_reverse_path(sampled, done_callback=done_callback, abort_callback=abort_callback)
 
     def _execute_reverse_path(
         self,
         waypoints: list,
         done_callback: Optional[Callable] = None,
+        abort_callback: Optional[Callable] = None,
     ) -> bool:
         """
         역방향 waypoint sequence를 순차 실행.
         각 waypoint 도착 실패 시 abort. done_callback은 전체 성공 시에만 호출.
+        abort_callback은 waypoint timeout 실패 시 호출.
         """
         if not waypoints:
             self.get_logger().error("_execute_reverse_path: empty waypoints.")
@@ -612,6 +667,8 @@ class PiperTeachReplayNode(Node):
                         f"(max_dist={max_dist:.3f}rad, timeout={timeout:.1f}s) — aborting."
                     )
                     self._log_event(f"reverse_return_abort_{idx}")
+                    if abort_callback:
+                        abort_callback()
                     return  # ★ abort — done_callback 호출 금지
 
                 # 그리퍼 명령 후 actuation 대기
@@ -629,6 +686,7 @@ class PiperTeachReplayNode(Node):
     def go_to_safe_ready(
         self,
         done_callback: Optional[Callable] = None,
+        abort_callback: Optional[Callable] = None,
         gripper_after: Optional[float] = None,
     ) -> bool:
         """
@@ -672,6 +730,7 @@ class PiperTeachReplayNode(Node):
         return self._follow_home_waypoints(
             waypoints=waypoints,
             done_callback=done_callback,
+            abort_callback=abort_callback,
             gripper_after=gripper_after,
         )
 
@@ -825,13 +884,39 @@ class PiperTeachReplayNode(Node):
         self.get_logger().info(f"Replay loop started: {len(trajectory)} waypoints, speed={speed_scale}")
         dt = 1.0 / TEACH_LOG_HZ / speed_scale  # 실제 간격 (속도 배율 적용)
 
+        # ── 저속 재생 smoothing (이동평균) ────────────────────────────────
+        # 저속 시 teach 궤적의 고주파 미세진동이 눈에 띄게 증폭됨.
+        # waypoint 수·dt 변경 없이 관절값만 이동평균으로 평탄화 → 총 시간 유지.
+        # 그리퍼 값은 전환점 타이밍 보존을 위해 원본 그대로 사용.
+        _SMOOTH_THRESHOLD = 0.8
+        if speed_scale < _SMOOTH_THRESHOLD and len(trajectory) > 4:
+            window = max(2, round(0.8 / speed_scale))  # 30% → window≈3, 50% → window≈2
+            half = window // 2
+            n_traj = len(trajectory)
+            smoothed = []
+            for _i in range(n_traj):
+                lo = max(0, _i - half)
+                hi = min(n_traj, _i + half + 1)
+                avg: dict = {f"q{k}": sum(trajectory[j].get(f"q{k}", 0.0) for j in range(lo, hi)) / (hi - lo)
+                             for k in range(1, 7)}
+                avg["gripper"] = trajectory[_i].get("gripper")  # gripper는 원본 유지
+                smoothed.append(avg)
+            self.get_logger().info(
+                f"[Replay] Smoothing: speed={speed_scale:.0%} window={window} ({n_traj} waypoints, dt={dt:.3f}s)"
+            )
+            trajectory = smoothed
+
         # ── 그리퍼 재생 전략 ──────────────────────────────────────────────
-        # 문제: teach 데이터의 gripper 값은 연속적으로 변하는 소수값(예: 0.069→0.006).
-        # 매 waypoint마다 미세한 delta를 GripperCtrl로 보내면 드라이버 deadband 이하라
-        # 하드웨어가 전혀 반응하지 않음.
-        # 해결: OPEN/CLOSE 상태 전환을 감지 → 정해진 target(GRIPPER_OPEN/CLOSE_RAD)으로
-        #       snap 명령. 닫을 때는 최대 힘(3N/m)으로 물체를 확실히 파지.
-        _GRIPPER_MID = (GRIPPER_OPEN_RAD + GRIPPER_CLOSE_RAD) / 2.0  # 0.035 rad
+        # 고정 임계값 0.027 rad: 이 이상이면 OPEN, 미만이면 CLOSED.
+        # - 닫힘(하드웨어) ≈ 0.008 rad → < 0.027 → CLOSED ✓
+        # - 50% 열림 ≈ 0.034 rad  → > 0.02219 → OPEN  ✓
+        # - 100% 열림 ≈ 0.070 rad → > 0.02219 → OPEN  ✓
+        _GRIPPER_MID = 0.02219
+        _g_all = [wp["gripper"] for wp in trajectory if wp.get("gripper") is not None]
+        self.get_logger().info(
+            f"[Replay] Gripper threshold: MID={_GRIPPER_MID:.4f} (fixed) "
+            f"teach range=[{min(_g_all) if _g_all else '?':.4f}, {max(_g_all) if _g_all else '?':.4f}]"
+        )
 
         # ── 그리퍼 전환 직전 keyframe 사전 계산 ──────────────────────────
         # 각 OPEN↔CLOSE 전환점 바로 직전 waypoint에서 도착을 확인한 뒤 gripper cmd를 보냄.
@@ -851,21 +936,25 @@ class PiperTeachReplayNode(Node):
         # trajectory 첫 번째 gripper 값으로 initial state 초기화.
         # prev_gripper_is_open = None 상태로 루프 진입하면 첫 waypoint에서
         # "None → CLOSED" 가짜 전환이 감지되어 replay 시작 즉시 그리퍼가 닫힘.
-        # 해결: 루프 전에 initial state를 설정하고 그리퍼를 해당 위치로 이동.
+        # 해결: prev_gripper_is_open을 첫 waypoint 기반으로 미리 설정.
+        # 루프 자체가 첫 waypoint에서 gripper_cmd_val를 publish하므로 별도 이동 불필요.
         first_gripper = next(
             (wp.get("gripper") for wp in trajectory if wp.get("gripper") is not None), None
         )
         if first_gripper is not None:
             initial_is_open = first_gripper > _GRIPPER_MID
-            initial_cmd = GRIPPER_OPEN_RAD if initial_is_open else GRIPPER_CLOSE_RAD
-            self.get_logger().info(
-                f"[Replay] Initial gripper: {'OPEN' if initial_is_open else 'CLOSE'} "
-                f"(raw={first_gripper:.4f}, target={initial_cmd:.3f})"
-            )
-            threading.Thread(target=self._gripper_move, args=(initial_cmd,), daemon=True).start()
-            time.sleep(0.4)  # 그리퍼 초기 이동 대기
             prev_gripper_is_open: Optional[bool] = initial_is_open
-            gripper_cmd_val: Optional[float] = initial_cmd
+            # 초기 상태도 전환 snap 로직과 동일하게 적용:
+            # - OPEN → GRIPPER_OPEN_RAD (100%)
+            # - CLOSED → GRIPPER_CLOSE_RAD (0%) : 임계값 미만은 항상 완전 닫힘으로 snap
+            if initial_is_open:
+                gripper_cmd_val: Optional[float] = GRIPPER_OPEN_RAD
+            else:
+                gripper_cmd_val: Optional[float] = GRIPPER_CLOSE_RAD
+            self.get_logger().info(
+                f"[Replay] Initial gripper preset: {'OPEN' if initial_is_open else 'CLOSE'} "
+                f"(raw={first_gripper:.4f} → cmd={gripper_cmd_val:.4f})"
+            )
         else:
             prev_gripper_is_open: Optional[bool] = None
             gripper_cmd_val: Optional[float] = None
@@ -889,15 +978,35 @@ class PiperTeachReplayNode(Node):
                     cur_is_open = (gripper > _GRIPPER_MID)
                     if cur_is_open != prev_gripper_is_open:
                         prev_gripper_is_open = cur_is_open
-                        gripper_cmd_val = GRIPPER_OPEN_RAD if cur_is_open else GRIPPER_CLOSE_RAD
+                        if cur_is_open:
+                            # 열 때: 항상 100% 완전 개방 → 물건을 확실히 놓음
+                            gripper_cmd_val = GRIPPER_OPEN_RAD
+                            snap_note = f" → snap to OPEN({GRIPPER_OPEN_RAD})"
+                        else:
+                            # 닫을 때: 항상 0% 완전 닫힘 → 물건을 확실히 집음
+                            gripper_cmd_val = GRIPPER_CLOSE_RAD
+                            snap_note = f" → snap to CLOSE({GRIPPER_CLOSE_RAD})"
                         # 닫을 때: 최대 힘(3 N/m) → 물체를 확실히 파지
                         # 열 때: 기본 힘(1 N/m)
                         gripper_cmd_effort = 1.0 if cur_is_open else 3.0
                         self.get_logger().info(
                             f"[Replay] Gripper {'OPEN' if cur_is_open else 'CLOSE'} "
-                            f"@ waypoint {i} (raw={gripper:.4f}, "
-                            f"target={gripper_cmd_val:.3f}, effort={gripper_cmd_effort}N/m)"
+                            f"@ waypoint {i} (teach={gripper:.4f}{snap_note}, effort={gripper_cmd_effort}N/m)"
                         )
+                        # ── 전환 시 multi-step 그리퍼 작동 (블로킹) ──────────────────
+                        # 단일 큰 step → 드라이버 미반응 문제 해결.
+                        # arm을 현재 waypoint pos에 hold하면서 그리퍼를 GRIPPER_STEPS 단계로 이동.
+                        with self._lock:
+                            _g_cur = (self._latest_position[DOF]
+                                      if len(self._latest_position) > DOF else 0.0)
+                        for _gs in range(1, GRIPPER_STEPS + 1):
+                            _g_inter = _g_cur + (gripper_cmd_val - _g_cur) * _gs / GRIPPER_STEPS
+                            self._publish_joint_cmd(
+                                pos, velocity=GRIPPER_VELOCITY,
+                                gripper=_g_inter, gripper_effort=gripper_cmd_effort,
+                            )
+                            time.sleep(GRIPPER_STEP_DELAY)
+                        time.sleep(0.15)  # 그리퍼 settle 후 다음 waypoint 진행
 
                 self._publish_joint_cmd(pos, velocity=cmd_velocity,
                                         gripper=gripper_cmd_val,
@@ -911,14 +1020,14 @@ class PiperTeachReplayNode(Node):
                 with self._lock:
                     self._replay_command_buffer.append(cmd_row)
 
-                # keyframe에서는 도착 확인 후 잠깐 settle (gripper cmd 직전 정밀 도착)
+                # keyframe: arm 도착 확인 (gripper 전환은 위에서 이미 처리됨)
                 if i in gripper_keyframes:
                     reached = self._wait_until_close(pos, tol=0.04, vel_tol=0.1, timeout=3.0)
                     if not reached:
                         self.get_logger().warn(
-                            f"[Replay] Keyframe {i}: not converged — gripper cmd will proceed anyway"
+                            f"[Replay] Keyframe {i}: not converged"
                         )
-                    time.sleep(0.1)  # gripper 명령 직전 짧은 settle
+                    time.sleep(0.1)
                 else:
                     time.sleep(dt)
 
