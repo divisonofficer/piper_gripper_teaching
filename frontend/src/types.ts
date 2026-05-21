@@ -51,7 +51,15 @@ export interface RobotState {
 }
 
 export interface SingleCameraState {
+  id?: string;
   name?: string;
+  label?: string;
+  role?: string;
+  type?: string;
+  legacy_id?: string;
+  streams?: string[];
+  enabled?: boolean;
+  aliases?: string[];
   device?: string;
   available: boolean;
   streaming?: boolean;
@@ -111,7 +119,31 @@ export interface EpisodeTake {
   has_teach: boolean;
   has_webcam_0?: boolean;
   has_webcam_1?: boolean;
+  cameras?: Array<{
+    id: string;
+    label: string;
+    role?: string;
+    legacy_id?: string;
+    video: string;
+  }>;
   size_mb?: number;
+}
+
+export interface CameraManifestEntry {
+  id: string;
+  label: string;
+  type: string;
+  role: string;
+  enabled: boolean;
+  device: string;
+  streams: string[];
+  legacy_id: string;
+  export_presets: string[];
+}
+
+export interface CameraManifest {
+  version: number;
+  cameras: CameraManifestEntry[];
 }
 
 export interface Episode {
@@ -122,6 +154,9 @@ export interface Episode {
   takes: EpisodeTake[];
   takes_count: number;
   size_mb?: number;
+  duration_s?: number | null;
+  preview_video_url?: string | null;
+  completeness?: Record<string, boolean>;
   has_postprocess?: boolean;  // 마지막 take에 활성화된 postprocess 편집이 있는지
   // 구버전 호환
   stats?: Record<string, number>;
@@ -161,6 +196,7 @@ export interface TrimMeta {
 
 export interface MaskMeta {
   enabled: boolean;
+  camera_id?: string;  // target RGB camera id/alias. Default: cam1 for legacy edit_meta
   polygon: [number, number][];  // normalized 0-1 좌표 (keep 영역 폴리곤)
   fill: "black" | "frame_capture";
   capture_t?: number;  // frame_capture 타입: 캡쳐 기준 시각(초)

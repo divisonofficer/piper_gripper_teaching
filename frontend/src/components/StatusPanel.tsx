@@ -2,6 +2,7 @@ import React, { useMemo } from "react";
 import type { AppMode, RobotState, CameraState, LoggerState, EventLog } from "../types";
 
 interface Props {
+  page?: "capture" | "dataset" | "diagnostics" | "setup";
   mode: AppMode;
   robot: RobotState;
   camera: CameraState;
@@ -147,7 +148,7 @@ function SafeChecklist({
 // ─── Main Panel ───────────────────────────────────────────────────────────────
 
 export default function StatusPanel({
-  mode, robot, camera, logger, events, availableActions, nextAction,
+  page = "capture", mode, robot, camera, logger, events, availableActions, nextAction,
 }: Props) {
   const joints = robot.position ?? [];
   const velocities = robot.velocity ?? [];
@@ -181,6 +182,76 @@ export default function StatusPanel({
           ? `Open (${gripperPct}%)`
           : `Partial (${gripperPct}%)`
       : "—";
+
+  if (page === "dataset") {
+    return (
+      <aside style={styles.panel}>
+        <section style={styles.hint}>
+          <div style={styles.hintLabel}>DATASET</div>
+          <div style={styles.hintText}>Browse saved episodes, inspect quality, edit tasks, postprocess, and export batches.</div>
+        </section>
+        <section style={styles.section}>
+          <div style={styles.sectionTitle}>Storage</div>
+          <Row label="Disk" value={logger.disk_free_gb !== undefined ? `${logger.disk_free_gb} GB` : "—"} ok={(logger.disk_free_gb ?? 999) > 10} />
+          <Row label="Logger" value={mode === "REPLAY_RECORDING" || mode === "PROCESSING" ? "Active" : "Idle"} ok={mode !== "REPLAY_RECORDING"} />
+        </section>
+        <section style={styles.section}>
+          <div style={styles.sectionTitle}>Inspector</div>
+          <div style={styles.contextNote}>Use the center inspector for selected episode details. Multi-select shows batch status and export actions.</div>
+        </section>
+      </aside>
+    );
+  }
+
+  if (page === "setup") {
+    return (
+      <aside style={styles.panel}>
+        <section style={styles.hint}>
+          <div style={styles.hintLabel}>SYSTEM SETUP</div>
+          <div style={styles.hintText}>Configure safe return, calibration, cameras, and storage.</div>
+        </section>
+        <section style={styles.section}>
+          <div style={styles.sectionTitle}>Current Pose</div>
+          {JOINT_LABELS.map(([j], i) => (
+            <Row key={j} label={j} value={joints[i] !== undefined ? joints[i].toFixed(3) : "—"} mono />
+          ))}
+        </section>
+        <section style={styles.section}>
+          <div style={styles.sectionTitle}>Calibration</div>
+          <Row label="Joint limits" value={robot.joint_limits ? "Loaded" : "Missing"} ok={robot.joint_limits != null} />
+          <Row label="Robot" value={robot.connected ? "Connected" : "Disconnected"} ok={robot.connected} />
+        </section>
+      </aside>
+    );
+  }
+
+  if (page === "diagnostics") {
+    return (
+      <aside style={styles.panel}>
+        <section style={styles.hint}>
+          <div style={styles.hintLabel}>DIAGNOSTICS</div>
+          <div style={styles.hintText}>Raw robot, camera, logger, and event details live here.</div>
+        </section>
+        <section style={styles.section}>
+          <div style={styles.sectionTitle}>Raw Summary</div>
+          <Row label="Robot Hz" value={robot.hz ? `${robot.hz} Hz` : "—"} ok={(robot.hz ?? 0) >= 40} />
+          <Row label="Cameras" value={camera.connected ? "Connected" : "Disconnected"} ok={camera.connected} />
+          <Row label="Episode" value={logger.episode_id?.slice(-12) ?? "—"} mono />
+        </section>
+        <section style={{ ...styles.section, flex: 1 }}>
+          <div style={styles.sectionTitle}>Recent Events</div>
+          <div style={styles.eventLog}>
+            {recentEvents.slice(0, 8).map((e, i) => (
+              <div key={i} style={styles.eventRow}>
+                <span style={styles.eventTime}>{new Date(e.t * 1000).toLocaleTimeString()}</span>
+                <span>{e.message}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      </aside>
+    );
+  }
 
   return (
     <aside style={styles.panel}>
@@ -367,5 +438,10 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#9ca3af",
     fontFamily: "monospace",
     flexShrink: 0,
+  },
+  contextNote: {
+    fontSize: 12,
+    color: "#64748b",
+    lineHeight: 1.5,
   },
 };

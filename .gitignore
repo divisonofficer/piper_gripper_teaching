@@ -23,7 +23,7 @@ frontend/.cache/
 *.crt
 
 # Dataset (large binary data — managed separately)
-dataset/
+/dataset/
 
 # Editor / OS
 .DS_Store

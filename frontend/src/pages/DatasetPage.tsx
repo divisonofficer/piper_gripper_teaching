@@ -1,41 +1,23 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import type { Episode, EpisodeTake, JointSample, TakeJointsData, EESample, TakeTrajectoryData, EditMeta, MaskMeta, MaskLibraryEntry } from "../types";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
+import type { Episode, EpisodeTake, JointSample, TakeJointsData, EditMeta, MaskMeta, MaskLibraryEntry, EESample, TakeTrajectoryData } from "../types";
+import PiperRobotViewer from "../components/PiperRobotViewer";
+import { CompletenessChips, EpisodeCollectionItem, StatusBadge } from "./dataset/DatasetCollection";
+import ExportModal from "./dataset/ExportModal";
+import { BatchInspector, EmptyInspector, SummaryItem } from "./dataset/InspectorSummary";
+import VideoPane, { type CameraTab } from "./dataset/VideoPane";
+import { fmtDate, fmtDuration, fmtMb, statusLabel, takeDuration, type InspectorTab, type ViewMode } from "./dataset/datasetUtils";
 
 // ── Constants ────────────────────────────────────────────────────────────
 const JOINT_COLORS = ["#6366f1", "#06b6d4", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6"];
 const JOINT_LABELS = ["J1", "J2", "J3", "J4", "J5", "J6"];
 
-// ── Helpers ───────────────────────────────────────────────────────────────
-function fmtMb(mb?: number): string {
-  if (mb === undefined || mb === null) return "—";
-  if (mb < 1) return `${Math.round(mb * 1024)} KB`;
-  if (mb < 1024) return `${mb.toFixed(1)} MB`;
-  return `${(mb / 1024).toFixed(2)} GB`;
-}
-
-function fmtDuration(seconds?: number): string {
-  if (seconds === undefined || seconds === null) return "—";
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = (seconds % 60).toFixed(0).padStart(2, "0");
-  return `${m}m ${s}s`;
-}
-
-function takeDuration(data: TakeJointsData | null): number | undefined {
-  if (!data) return undefined;
-  for (const src of ["teach", "executed", "command"] as const) {
-    const samples = data[src];
-    if (samples.length > 1) return samples[samples.length - 1].t;
-  }
-  return undefined;
-}
-
 // ── Joint Plot SVG (P1) ───────────────────────────────────────────────────
 const JointPlot = React.memo(function JointPlot({
-  data, source,
+  data, source, currentTime,
 }: {
   data: TakeJointsData;
   source: "teach" | "executed" | "command";
+  currentTime: number;
 }) {
   const samples: JointSample[] = data[source];
   if (!samples || samples.length === 0) {
@@ -81,7 +63,7 @@ const JointPlot = React.memo(function JointPlot({
   const timeTicks = [0, tRange / 2, tRange];
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: "100%", height: "100%", minHeight: 0, display: "block" }}>
       {ticks.map((v, i) => (
         <g key={i}>
           <line x1={PADL} y1={yScale(v)} x2={W - PADR} y2={yScale(v)}
@@ -111,173 +93,203 @@ const JointPlot = React.memo(function JointPlot({
           {t.toFixed(1)}s
         </text>
       ))}
+      {/* 현재 재생 시간 세로선 */}
+      {currentTime > 0 && currentTime <= tRange && (() => {
+        const cx = xScale(currentTime);
+        return (
+          <g>
+            <line x1={cx} y1={PADT} x2={cx} y2={H - PADB}
+              stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="3 2" />
+            <text x={cx + 3} y={PADT + 9} fontSize={7} fill="#f59e0b">
+              {currentTime.toFixed(1)}s
+            </text>
+          </g>
+        );
+      })()}
     </svg>
   );
 });
 
 const plotStyles: Record<string, React.CSSProperties> = {
   empty: {
-    height: 150, display: "flex", alignItems: "center",
+    height: "100%", display: "flex", alignItems: "center",
     justifyContent: "center", color: "#94a3b8", fontSize: 12,
     background: "#f8fafc", borderRadius: 6,
   },
 };
 
-// ── Trajectory SVG components ─────────────────────────────────────────────
-
-const TRAJ_W = 500, TRAJ_H = 200, TRAJ_PAD = 28;
-
-function trajScale(
-  vals: number[], plotSize: number, pad: number = TRAJ_PAD
-): { scale: (v: number) => number; ticks: number[] } {
-  const min = Math.min(...vals), max = Math.max(...vals);
-  const range = max - min || 0.001;
-  const lo = min - range * 0.1, hi = max + range * 0.1;
-  const scale = (v: number) => pad + ((v - lo) / (hi - lo)) * plotSize;
-  const ticks = [lo, (lo + hi) / 2, hi];
-  return { scale, ticks };
+// ── Trajectory scale helper ───────────────────────────────────────────────
+function trajScale(vals: number[], plotSize: number, pad = 28) {
+  const usable = plotSize - pad * 2;
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (!isFinite(lo) || !isFinite(hi) || lo === hi) { lo -= 0.5; hi += 0.5; }
+  const margin = (hi - lo) * 0.1;
+  lo -= margin; hi += margin;
+  const range = hi - lo;
+  const scale = (v: number) => pad + ((v - lo) / range) * usable;
+  const tickCount = 4;
+  const ticks = Array.from({ length: tickCount + 1 }, (_, i) => lo + (range * i) / tickCount);
+  return { scale, ticks, lo, hi };
 }
 
-function gripperEvents(samples: EESample[]): { x: number; y: number; open: boolean }[] {
-  const result: { x: number; y: number; open: boolean }[] = [];
-  for (let i = 1; i < samples.length; i++) {
-    const prev = samples[i - 1].gripper > 0.035;
-    const curr = samples[i].gripper > 0.035;
-    if (prev !== curr) result.push({ x: i, y: 0, open: curr });
-  }
-  return result;
-}
-
+// ── TrajectoryPlanView (XY plan view) ────────────────────────────────────
 const TrajectoryPlanView = React.memo(function TrajectoryPlanView({
   samples, currentTime,
 }: { samples: EESample[]; currentTime: number }) {
-  if (!samples.length) return <div style={plotStyles.empty}>No data</div>;
+  if (!samples || samples.length === 0)
+    return <div style={plotStyles.empty}>No trajectory data</div>;
 
-  const W = TRAJ_W, H = TRAJ_H, PAD = TRAJ_PAD;
-  const plotW = W - PAD * 2, plotH = H - PAD * 2;
+  const W = 500, H = 200, PAD = 28;
 
   const xs = samples.map(s => s.ee[0]);
   const ys = samples.map(s => s.ee[1]);
-  const { scale: sx, ticks: xTicks } = trajScale(xs, plotW);
-  const { scale: syRaw, ticks: yTicks } = trajScale(ys, plotH);
-  // flip y so positive is up
-  const sy = (v: number) => H - syRaw(v);
+  const { scale: xScale, ticks: xTicks } = trajScale(xs, W, PAD);
+  const { scale: yRaw, ticks: yTicks } = trajScale(ys, H, PAD);
+  // flip Y so up = positive
+  const yScale = (v: number) => H - yRaw(v);
 
-  const pts = samples.map(s => `${sx(s.ee[0]).toFixed(1)},${sy(s.ee[1]).toFixed(1)}`).join(" ");
+  const polyline = samples.map(s => `${xScale(s.ee[0]).toFixed(1)},${yScale(s.ee[1]).toFixed(1)}`).join(" ");
 
-  // base origin
-  const bx = sx(0), by = sy(0);
+  const gripperDots: { x: number; y: number; open: boolean }[] = [];
+  for (let i = 1; i < samples.length; i++) {
+    const prev = samples[i - 1].gripper > 0.035;
+    const curr = samples[i].gripper > 0.035;
+    if (prev !== curr) {
+      gripperDots.push({ x: xScale(samples[i].ee[0]), y: yScale(samples[i].ee[1]), open: curr });
+    }
+  }
 
-  // current cursor
-  const tRange = samples[samples.length - 1].t || 1;
-  const curIdx = Math.min(samples.length - 1,
-    samples.findIndex(s => s.t >= currentTime) === -1
-      ? samples.length - 1
-      : Math.max(0, samples.findIndex(s => s.t >= currentTime)));
-  const cur = samples[curIdx];
+  const nearest = samples.reduce((best, s) =>
+    Math.abs(s.t - currentTime) < Math.abs(best.t - currentTime) ? s : best);
+  const cx = xScale(nearest.ee[0]);
+  const cy = yScale(nearest.ee[1]);
+
+  const base = { x: xScale(0), y: yScale(0) };
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
-      <rect width={W} height={H} rx={6} fill="#f8fafc" />
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+      style={{ width: "100%", height: "100%", display: "block" }}>
       {/* grid */}
-      {yTicks.map((v, i) => (
-        <g key={i}>
-          <line x1={PAD} x2={W - PAD} y1={sy(v)} y2={sy(v)} stroke="#e2e8f0" strokeWidth={0.8} />
-          <text x={PAD - 3} y={sy(v) + 3} textAnchor="end" fontSize={7} fill="#94a3b8">
+      {xTicks.map((v, i) => (
+        <g key={`xg${i}`}>
+          <line x1={xScale(v)} y1={PAD} x2={xScale(v)} y2={H - PAD} stroke="#e2e8f0" strokeWidth={0.7} />
+          <text x={xScale(v)} y={H - 4} textAnchor="middle" fontSize={7} fill="#94a3b8">
             {v.toFixed(2)}m
           </text>
         </g>
       ))}
-      {xTicks.map((v, i) => (
-        <text key={i} x={sx(v)} y={H - 4} textAnchor="middle" fontSize={7} fill="#94a3b8">
-          {v.toFixed(2)}
-        </text>
+      {yTicks.map((v, i) => (
+        <g key={`yg${i}`}>
+          <line x1={PAD} y1={yScale(v)} x2={W - PAD} y2={yScale(v)} stroke="#e2e8f0" strokeWidth={0.7} />
+          <text x={PAD - 3} y={yScale(v) + 3} textAnchor="end" fontSize={7} fill="#94a3b8">
+            {v.toFixed(2)}
+          </text>
+        </g>
       ))}
-      {/* base */}
-      <circle cx={bx} cy={by} r={5} fill="#1e293b" />
-      <text x={bx + 6} y={by - 5} fontSize={7} fill="#64748b">base</text>
       {/* path */}
-      <polyline points={pts} fill="none" stroke="#2563eb" strokeWidth={2} strokeLinejoin="round" />
+      <polyline points={polyline} fill="none" stroke="#3b82f6" strokeWidth={1.5}
+        strokeLinejoin="round" strokeLinecap="round" />
+      {/* base */}
+      <circle cx={base.x} cy={base.y} r={5} fill="none" stroke="#64748b" strokeWidth={1.5} />
       {/* start / end */}
-      <circle cx={sx(samples[0].ee[0])} cy={sy(samples[0].ee[1])} r={4} fill="#22c55e" />
-      <circle cx={sx(samples[samples.length-1].ee[0])} cy={sy(samples[samples.length-1].ee[1])} r={4} fill="#ef4444" />
+      <circle cx={xScale(samples[0].ee[0])} cy={yScale(samples[0].ee[1])} r={4} fill="#22c55e" />
+      <circle cx={xScale(samples[samples.length - 1].ee[0])} cy={yScale(samples[samples.length - 1].ee[1])} r={4} fill="#ef4444" />
       {/* gripper events */}
-      {samples.map((s, i) => {
-        if (i === 0) return null;
-        const prev = samples[i-1].gripper > 0.035, curr = s.gripper > 0.035;
-        if (prev === curr) return null;
-        return <circle key={i} cx={sx(s.ee[0])} cy={sy(s.ee[1])} r={5} fill={curr ? "#22c55e" : "#ef4444"} opacity={0.8} />;
-      })}
+      {gripperDots.map((d, i) => (
+        <circle key={i} cx={d.x} cy={d.y} r={3}
+          fill={d.open ? "#22c55e" : "#ef4444"} opacity={0.75} />
+      ))}
       {/* cursor */}
-      <circle cx={sx(cur.ee[0])} cy={sy(cur.ee[1])} r={6} fill="#f59e0b" stroke="#fff" strokeWidth={2} />
-      <text x={W - PAD} y={14} textAnchor="end" fontSize={8} fill="#94a3b8">XY Plan View</text>
+      <circle cx={cx} cy={cy} r={5} fill="#f59e0b" opacity={0.9} />
     </svg>
   );
 });
 
+// ── TrajectorySideView (Reach/Z side view) ────────────────────────────────
 const TrajectorySideView = React.memo(function TrajectorySideView({
   samples, currentTime,
 }: { samples: EESample[]; currentTime: number }) {
-  if (!samples.length) return <div style={plotStyles.empty}>No data</div>;
+  if (!samples || samples.length === 0)
+    return <div style={plotStyles.empty}>No trajectory data</div>;
 
-  const W = TRAJ_W, H = TRAJ_H, PAD = TRAJ_PAD;
-  const plotW = W - PAD * 2, plotH = H - PAD * 2;
+  const W = 500, H = 200, PAD = 28;
 
-  // X = horizontal reach from base, Y = height (z)
   const reaches = samples.map(s => Math.sqrt(s.ee[0] ** 2 + s.ee[1] ** 2));
   const zs = samples.map(s => s.ee[2]);
-  const { scale: sr, ticks: rTicks } = trajScale(reaches, plotW);
-  const { scale: szRaw, ticks: zTicks } = trajScale(zs, plotH);
-  const sz = (v: number) => H - szRaw(v);
+  const { scale: xScale, ticks: xTicks } = trajScale(reaches, W, PAD);
+  const { scale: yRaw, ticks: yTicks } = trajScale(zs, H, PAD);
+  const yScale = (v: number) => H - yRaw(v);
 
-  const pts = samples.map((s, i) => `${sr(reaches[i]).toFixed(1)},${sz(s.ee[2]).toFixed(1)}`).join(" ");
+  const polyline = samples.map((s, i) =>
+    `${xScale(reaches[i]).toFixed(1)},${yScale(s.ee[2]).toFixed(1)}`).join(" ");
 
-  const curIdx = Math.min(samples.length - 1,
-    samples.findIndex(s => s.t >= currentTime) === -1
-      ? samples.length - 1
-      : Math.max(0, samples.findIndex(s => s.t >= currentTime)));
-  const cur = samples[curIdx];
+  const gripperDots: { x: number; y: number; open: boolean }[] = [];
+  for (let i = 1; i < samples.length; i++) {
+    const prev = samples[i - 1].gripper > 0.035;
+    const curr = samples[i].gripper > 0.035;
+    if (prev !== curr) {
+      gripperDots.push({ x: xScale(reaches[i]), y: yScale(samples[i].ee[2]), open: curr });
+    }
+  }
 
-  // skeleton at current frame
-  const base = [0, 0, 0] as [number, number, number];
-  const skelPts = [[0, 0, 0] as [number, number, number], ...cur.links]
-    .map(p => {
-      const r = Math.sqrt(p[0] ** 2 + p[1] ** 2);
-      return `${sr(r).toFixed(1)},${sz(p[2]).toFixed(1)}`;
-    }).join(" ");
+  const nearest = samples.reduce((best, s) =>
+    Math.abs(s.t - currentTime) < Math.abs(best.t - currentTime) ? s : best);
+  const nearestIdx = samples.indexOf(nearest);
+  const cx = xScale(reaches[nearestIdx]);
+  const cy = yScale(nearest.ee[2]);
+
+  // skeleton: draw link positions as dashed polyline
+  const skeletonPoints = nearest.links && nearest.links.length > 0
+    ? [
+        [0, 0, 0] as [number, number, number],
+        ...nearest.links,
+        nearest.ee,
+      ].map(p => {
+        const r = Math.sqrt(p[0] ** 2 + p[1] ** 2);
+        return `${xScale(r).toFixed(1)},${yScale(p[2]).toFixed(1)}`;
+      }).join(" ")
+    : "";
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
-      <rect width={W} height={H} rx={6} fill="#f8fafc" />
-      {zTicks.map((v, i) => (
-        <g key={i}>
-          <line x1={PAD} x2={W - PAD} y1={sz(v)} y2={sz(v)} stroke="#e2e8f0" strokeWidth={0.8} />
-          <text x={PAD - 3} y={sz(v) + 3} textAnchor="end" fontSize={7} fill="#94a3b8">
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+      style={{ width: "100%", height: "100%", display: "block" }}>
+      {/* grid */}
+      {xTicks.map((v, i) => (
+        <g key={`xg${i}`}>
+          <line x1={xScale(v)} y1={PAD} x2={xScale(v)} y2={H - PAD} stroke="#e2e8f0" strokeWidth={0.7} />
+          <text x={xScale(v)} y={H - 4} textAnchor="middle" fontSize={7} fill="#94a3b8">
             {(v * 100).toFixed(0)}cm
           </text>
         </g>
       ))}
-      {rTicks.map((v, i) => (
-        <text key={i} x={sr(v)} y={H - 4} textAnchor="middle" fontSize={7} fill="#94a3b8">
-          {(v * 100).toFixed(0)}cm
-        </text>
+      {yTicks.map((v, i) => (
+        <g key={`yg${i}`}>
+          <line x1={PAD} y1={yScale(v)} x2={W - PAD} y2={yScale(v)} stroke="#e2e8f0" strokeWidth={0.7} />
+          <text x={PAD - 3} y={yScale(v) + 3} textAnchor="end" fontSize={7} fill="#94a3b8">
+            {(v * 100).toFixed(0)}
+          </text>
+        </g>
       ))}
-      {/* EE path */}
-      <polyline points={pts} fill="none" stroke="#0891b2" strokeWidth={2} strokeLinejoin="round" />
-      <circle cx={sr(reaches[0])} cy={sz(samples[0].ee[2])} r={4} fill="#22c55e" />
-      <circle cx={sr(reaches[samples.length-1])} cy={sz(samples[samples.length-1].ee[2])} r={4} fill="#ef4444" />
       {/* skeleton */}
-      <polyline points={skelPts} fill="none" stroke="#94a3b8" strokeWidth={1.5}
-        strokeLinejoin="round" strokeDasharray="4 2" />
-      {[[0,0,0] as [number,number,number], ...cur.links].map((p, i) => {
-        const r = Math.sqrt(p[0]**2 + p[1]**2);
-        return <circle key={i} cx={sr(r)} cy={sz(p[2])} r={i === 0 ? 4 : 3}
-          fill={i === 0 ? "#1e293b" : "#6366f1"} />;
+      {skeletonPoints && (
+        <polyline points={skeletonPoints} fill="none" stroke="#94a3b8"
+          strokeWidth={1} strokeDasharray="4 3" opacity={0.6} />
+      )}
+      {/* link dots */}
+      {nearest.links && nearest.links.map((lp, i) => {
+        const r = Math.sqrt(lp[0] ** 2 + lp[1] ** 2);
+        return <circle key={i} cx={xScale(r)} cy={yScale(lp[2])} r={2.5} fill="#94a3b8" />;
       })}
-      {/* cursor on EE path */}
-      <circle cx={sr(Math.sqrt(cur.ee[0]**2 + cur.ee[1]**2))} cy={sz(cur.ee[2])}
-        r={6} fill="#f59e0b" stroke="#fff" strokeWidth={2} />
-      <text x={W - PAD} y={14} textAnchor="end" fontSize={8} fill="#94a3b8">Side / Reach-Z View</text>
+      {/* ee path */}
+      <polyline points={polyline} fill="none" stroke="#06b6d4" strokeWidth={1.5}
+        strokeLinejoin="round" strokeLinecap="round" />
+      {/* gripper events */}
+      {gripperDots.map((d, i) => (
+        <circle key={i} cx={d.x} cy={d.y} r={3}
+          fill={d.open ? "#22c55e" : "#ef4444"} opacity={0.75} />
+      ))}
+      {/* cursor */}
+      <circle cx={cx} cy={cy} r={5} fill="#f59e0b" opacity={0.9} />
     </svg>
   );
 });
@@ -300,15 +312,14 @@ export default function DatasetPage() {
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [selected, setSelected] = useState<Episode | null>(null);
   const [selectedTake, setSelectedTake] = useState<string | null>(null);
-  const [videoSource, setVideoSource] = useState<"color" | "depth" | "webcam_0" | "webcam_1">("color");
-  const [jointSource, setJointSource] = useState<"teach" | "executed" | "command">("teach");
+  const [videoSource, setVideoSource] = useState<string>("color");
+  const [jointSource, setJointSource] = useState<"teach" | "executed" | "command">("executed");
   const [jointsData, setJointsData] = useState<TakeJointsData | null>(null);
   const [jointsLoading, setJointsLoading] = useState(false);
   const [trajectoryData, setTrajectoryData] = useState<TakeTrajectoryData | null>(null);
-  const [trajLoading, setTrajLoading] = useState(false);
+  const [view2D, setView2D] = useState<"plan" | "side">("plan");
   const [currentTime, setCurrentTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
-  const videoRef = useRef<HTMLVideoElement>(null);
   const [filter, setFilter] = useState<"all" | "success" | "failure" | "unlabeled">("all");
   const [search, setSearch] = useState("");
   const [confirmDeleteEp, setConfirmDeleteEp] = useState<string | null>(null);
@@ -319,11 +330,17 @@ export default function DatasetPage() {
   const [includeFrames, setIncludeFrames] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportingLerobot, setExportingLerobot] = useState(false);
+  const [lerobotPreset, setLerobotPreset] = useState<"default" | "all" | "debug">("default");
   const [bulkTask, setBulkTask] = useState("");
   const [bulkTaskSaving, setBulkTaskSaving] = useState(false);
   const [editMeta, setEditMeta] = useState<EditMeta | null>(null);
-  const [sortBy, setSortBy] = useState<"date" | "task">("date");
+  const [sortBy, setSortBy] = useState<"date" | "task" | "size" | "duration" | "status">("date");
+  const [viewMode, setViewMode] = useState<ViewMode>("thumbnail");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("preview");
+  const [postprocessMaskCameraId, setPostprocessMaskCameraId] = useState<string>("cam1");
   const [hoveredEp, setHoveredEp] = useState<string | null>(null);
+  const [focusedEp, setFocusedEp] = useState<string | null>(null);
+  const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null);
   const [exportModal, setExportModal] = useState(false);
 
   const fetchEpisodes = useCallback(() => {
@@ -348,6 +365,22 @@ export default function DatasetPage() {
   }, [selectedId]);
 
   useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelectedEps(new Set());
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  useEffect(() => {
+    if (selectedEps.size !== 1) return;
+    const onlyId = Array.from(selectedEps)[0];
+    if (selected?.episode_id === onlyId) return;
+    const ep = episodes.find(e => e.episode_id === onlyId);
+    if (ep) setSelected(ep);
+  }, [episodes, selected, selectedEps]);
+
+  useEffect(() => {
     if (!selectedId || !selectedTake) { setJointsData(null); return; }
     setJointsLoading(true);
     fetch(`/api/episodes/${selectedId}/takes/${selectedTake}/joints`)
@@ -358,12 +391,19 @@ export default function DatasetPage() {
 
   useEffect(() => {
     if (!selectedId || !selectedTake) { setTrajectoryData(null); return; }
-    setTrajLoading(true);
     fetch(`/api/episodes/${selectedId}/takes/${selectedTake}/trajectory`)
       .then(r => r.ok ? r.json() : null)
-      .then(d => { setTrajectoryData(d); setTrajLoading(false); })
-      .catch(() => { setTrajectoryData(null); setTrajLoading(false); });
+      .then(d => setTrajectoryData(d))
+      .catch(() => setTrajectoryData(null));
   }, [selectedId, selectedTake]);
+
+  const nearestSample = useMemo(() => {
+    const arr = trajectoryData?.[jointSource];
+    if (!arr?.length) return null;
+    return arr.reduce((best, s) =>
+      Math.abs(s.t - currentTime) < Math.abs(best.t - currentTime) ? s : best
+    );
+  }, [trajectoryData, jointSource, currentTime]);
 
   useEffect(() => {
     if (!selectedId || !selectedTake) { setEditMeta(null); return; }
@@ -385,10 +425,14 @@ export default function DatasetPage() {
   }), [episodes, filter, search]);
 
   const sorted = useMemo(() => {
-    if (sortBy === "task") {
-      return [...filtered].sort((a, b) => (a.task ?? "").localeCompare(b.task ?? ""));
+    const next = [...filtered];
+    if (sortBy === "task") return next.sort((a, b) => (a.task ?? "").localeCompare(b.task ?? ""));
+    if (sortBy === "size") return next.sort((a, b) => (b.size_mb ?? 0) - (a.size_mb ?? 0));
+    if (sortBy === "duration") return next.sort((a, b) => (b.duration_s ?? 0) - (a.duration_s ?? 0));
+    if (sortBy === "status") {
+      return next.sort((a, b) => statusLabel(a.success).localeCompare(statusLabel(b.success)));
     }
-    return filtered;
+    return next;
   }, [filtered, sortBy]);
 
   const totalSize = useMemo(() =>
@@ -440,14 +484,54 @@ export default function DatasetPage() {
     }).catch(() => {});
   }, []);
 
-  const toggleEpSelect = useCallback((epId: string, e: React.MouseEvent) => {
+  const setRangeSelection = useCallback((from: number, to: number, additive: boolean) => {
+    const [start, end] = from < to ? [from, to] : [to, from];
+    const ids = sorted.slice(start, end + 1).map(ep => ep.episode_id);
+    setSelectedEps(prev => {
+      const next = additive ? new Set(prev) : new Set<string>();
+      ids.forEach(id => next.add(id));
+      return next;
+    });
+  }, [sorted]);
+
+  const toggleEpSelect = useCallback((epId: string, index: number, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (e.shiftKey && lastClickedIndex !== null) {
+      setRangeSelection(lastClickedIndex, index, e.ctrlKey || e.metaKey);
+      return;
+    }
     setSelectedEps(prev => {
       const next = new Set(prev);
       next.has(epId) ? next.delete(epId) : next.add(epId);
       return next;
     });
-  }, []);
+    setLastClickedIndex(index);
+  }, [lastClickedIndex, setRangeSelection]);
+
+  const handleEpisodeClick = useCallback((ep: Episode, index: number, e: React.MouseEvent) => {
+    setSelected(ep);
+    setConfirmDeleteEp(null);
+    const selectionMode = selectedEps.size > 0;
+    if (e.shiftKey && lastClickedIndex !== null) {
+      setRangeSelection(lastClickedIndex, index, true);
+    } else if (e.ctrlKey || e.metaKey) {
+      setSelectedEps(prev => {
+        const next = new Set(prev);
+        next.has(ep.episode_id) ? next.delete(ep.episode_id) : next.add(ep.episode_id);
+        return next;
+      });
+      setLastClickedIndex(index);
+    } else if (selectionMode) {
+      setSelectedEps(prev => {
+        const next = new Set(prev);
+        next.has(ep.episode_id) ? next.delete(ep.episode_id) : next.add(ep.episode_id);
+        return next;
+      });
+      setLastClickedIndex(index);
+    } else {
+      setLastClickedIndex(index);
+    }
+  }, [lastClickedIndex, selectedEps.size, setRangeSelection]);
 
   const exportSelected = useCallback(() => {
     if (!selectedEps.size || exporting) return;
@@ -479,7 +563,7 @@ export default function DatasetPage() {
     fetch("/api/episodes/export_lerobot", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ episode_ids: [...selectedEps] }),
+      body: JSON.stringify({ episode_ids: [...selectedEps], preset: lerobotPreset }),
     })
       .then(r => {
         if (!r.ok) throw new Error("export_lerobot failed");
@@ -495,7 +579,7 @@ export default function DatasetPage() {
       })
       .catch(() => {})
       .finally(() => setExportingLerobot(false));
-  }, [selectedEps, exportingLerobot]);
+  }, [selectedEps, exportingLerobot, lerobotPreset]);
 
   const applyBulkTask = useCallback(() => {
     if (!selectedEps.size || bulkTaskSaving) return;
@@ -554,17 +638,66 @@ export default function DatasetPage() {
     });
   }, [episodes, filtered, selectedEps]);
 
-  const nearestSample = useMemo((): EESample | null => {
-    const arr = trajectoryData?.[jointSource];
-    if (!arr || !arr.length) return null;
-    let best = arr[0];
-    for (const s of arr) {
-      if (Math.abs(s.t - currentTime) < Math.abs(best.t - currentTime)) best = s;
-    }
-    return best;
-  }, [trajectoryData, jointSource, currentTime]);
-
   const currentTake: EpisodeTake | null = selected?.takes.find(t => t.take === selectedTake) ?? null;
+  const cameraTabs = useMemo<CameraTab[]>(() => {
+    if (!currentTake) return [];
+    const hasRealSenseBaseStreams = !!currentTake.has_video;
+    const manifestTabs = currentTake.cameras?.length
+      ? currentTake.cameras
+          // RealSense is represented by the dedicated RGB/Depth stream tabs below.
+          // Keeping the manifest camera too would show RGB twice.
+          .filter(c => !(hasRealSenseBaseStreams && c.id === "realsense"))
+          .map(c => ({
+            id: c.id,
+            label: c.label || c.id,
+            avail: true,
+            maskable: true,
+            maskCameraId: c.id,
+          }))
+      : [
+          { id: "webcam_0", label: "Cam0 Ego", avail: !!currentTake.has_webcam_0, maskable: true, maskCameraId: "cam0" },
+          { id: "webcam_1", label: "Cam1 Overview", avail: !!currentTake.has_webcam_1, maskable: true, maskCameraId: "cam1" },
+        ];
+    return [
+      { id: "color", label: "RealSense RGB", avail: hasRealSenseBaseStreams, maskable: true, maskCameraId: "realsense" },
+      { id: "depth", label: "RealSense Depth", avail: hasRealSenseBaseStreams, maskable: false },
+      ...manifestTabs,
+    ];
+  }, [currentTake]);
+
+  const maskableCameraTabs = useMemo(
+    () => cameraTabs.filter(tab => tab.avail && tab.maskable && tab.maskCameraId),
+    [cameraTabs],
+  );
+
+  const videoSourceForMaskCamera = useCallback((cameraId: string) => {
+    const tab = cameraTabs.find(t => t.maskCameraId === cameraId && t.avail);
+    return tab?.id ?? cameraId;
+  }, [cameraTabs]);
+
+  const maskCameraForVideoSource = useCallback((source: string) => {
+    return cameraTabs.find(t => t.id === source && t.maskable)?.maskCameraId;
+  }, [cameraTabs]);
+
+  useEffect(() => {
+    if (!editMeta) return;
+    setPostprocessMaskCameraId(editMeta.mask.camera_id || "cam1");
+  }, [editMeta]);
+
+  useEffect(() => {
+    if (inspectorTab !== "postprocess") return;
+    const target = editMeta?.mask.camera_id || postprocessMaskCameraId || maskableCameraTabs[0]?.maskCameraId;
+    if (!target) return;
+    setPostprocessMaskCameraId(target);
+    setVideoSource(videoSourceForMaskCamera(target));
+  }, [inspectorTab, editMeta, maskableCameraTabs, postprocessMaskCameraId, videoSourceForMaskCamera]);
+
+  const handleVideoSourceChange = useCallback((source: string) => {
+    setVideoSource(source);
+    if (inspectorTab !== "postprocess") return;
+    const target = maskCameraForVideoSource(source);
+    if (target) setPostprocessMaskCameraId(target);
+  }, [inspectorTab, maskCameraForVideoSource]);
 
   const videoUrl = useMemo(() => {
     if (!selectedId || !selectedTake) return null;
@@ -573,10 +706,38 @@ export default function DatasetPage() {
     if (videoSource === "depth") return `${base}/video_depth`;
     if (videoSource === "webcam_0") return `${base}/video_webcam_0`;
     if (videoSource === "webcam_1") return `${base}/video_webcam_1`;
-    return null;
+    return `${base}/video_camera/${videoSource}`;
   }, [selectedId, selectedTake, videoSource]);
 
   const duration = takeDuration(jointsData);
+  const selectedBatch = useMemo(
+    () => episodes.filter(ep => selectedEps.has(ep.episode_id)),
+    [episodes, selectedEps],
+  );
+  const batchStatus = useMemo(() => ({
+    success: selectedBatch.filter(ep => ep.success === true).length,
+    failure: selectedBatch.filter(ep => ep.success === false).length,
+    unlabeled: selectedBatch.filter(ep => ep.success !== true && ep.success !== false).length,
+  }), [selectedBatch]);
+
+  // lerobot converter와 동일한 시간 보정:
+  // executed/command joint의 실제 시간축(0..joint_dur)을 video_duration으로 선형 스케일링
+  // teach는 비디오가 teach duration 기준으로 인코딩되므로 그대로 사용
+  const remappedJointsData = useMemo((): TakeJointsData | null => {
+    if (!jointsData) return null;
+    const remap = (samples: JointSample[], src: "teach" | "executed" | "command"): JointSample[] => {
+      if (src === "teach" || !videoDuration || samples.length === 0) return samples;
+      const tMax = samples[samples.length - 1].t;
+      if (tMax <= 0) return samples;
+      const scale = videoDuration / tMax;
+      return samples.map(s => ({ ...s, t: s.t * scale }));
+    };
+    return {
+      teach:    remap(jointsData.teach,    "teach"),
+      executed: remap(jointsData.executed, "executed"),
+      command:  remap(jointsData.command,  "command"),
+    };
+  }, [jointsData, videoDuration]);
 
   return (
     <div style={styles.root}>
@@ -600,11 +761,33 @@ export default function DatasetPage() {
               {f === "all" ? "All" : f === "success" ? "✓" : f === "failure" ? "✗" : "?"}
             </button>
           ))}
-          <select value={sortBy} onChange={e => setSortBy(e.target.value as "date" | "task")}
+          <select value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)}
             style={{ padding: "3px 6px", borderRadius: 5, border: "1px solid #e5e7eb", fontSize: 11, background: "#fff" }}>
             <option value="date">최신순</option>
             <option value="task">task순</option>
+            <option value="size">용량순</option>
+            <option value="duration">길이순</option>
+            <option value="status">상태순</option>
           </select>
+          <div style={styles.viewToggle}>
+            {([
+              ["compact", "List"],
+              ["thumbnail", "Thumb"],
+              ["grid", "Grid"],
+            ] as Array<[ViewMode, string]>).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setViewMode(mode)}
+                style={{
+                  ...styles.viewBtn,
+                  background: viewMode === mode ? "#111827" : "#fff",
+                  color: viewMode === mode ? "#fff" : "#475569",
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <button style={styles.refreshBtn} onClick={fetchEpisodes}>↻</button>
         </div>
       </div>
@@ -613,10 +796,10 @@ export default function DatasetPage() {
       {selectedEps.size > 0 && (
         <div style={styles.exportBar}>
           <span style={{ fontSize: 12, color: "#1e293b", fontWeight: 600, flexShrink: 0 }}>
-            {selectedEps.size}개 선택
+            {selectedEps.size} selected
           </span>
           <button onClick={selectSameTask} style={{ ...styles.exportBarBtn, background: "#0891b2", fontSize: 11 }}>
-            같은 task 선택
+            Select Same Task
           </button>
           <input
             type="text" placeholder="task 일괄 설정…" value={bulkTask}
@@ -629,6 +812,10 @@ export default function DatasetPage() {
             {bulkTaskSaving ? "…" : "Set"}
           </button>
           <div style={{ flex: 1 }} />
+          <button onClick={() => setInspectorTab("postprocess")}
+            style={{ ...styles.exportBarBtn, background: "#7c3aed", fontSize: 11 }}>
+            Postprocess
+          </button>
           <button onClick={() => setExportModal(true)}
             style={{ ...styles.exportBarBtn, background: "#059669", fontSize: 11 }}>
             ↓ Export
@@ -647,7 +834,9 @@ export default function DatasetPage() {
           exporting={exporting}
           exportingLerobot={exportingLerobot}
           includeFrames={includeFrames}
+          lerobotPreset={lerobotPreset}
           onIncludeFrames={setIncludeFrames}
+          onLerobotPreset={setLerobotPreset}
           onExportZip={exportSelected}
           onExportLerobot={exportLerobot}
           onClose={() => setExportModal(false)}
@@ -656,68 +845,73 @@ export default function DatasetPage() {
 
       {/* Body */}
       <div style={styles.body}>
-        {/* Episode list */}
-        <div style={styles.listPanel}>
+        {/* Episode collection */}
+        <div style={{
+          ...styles.listPanel,
+          width: viewMode === "grid" ? 620 : viewMode === "compact" ? 640 : 430,
+          flexShrink: viewMode === "thumbnail" ? 0 : 1,
+          maxWidth: viewMode === "grid" ? "min(620px, 56vw)" : undefined,
+        }}>
+          <div style={styles.collectionHeader}>
+            <span>Collection</span>
+            <span>{sorted.length} shown</span>
+          </div>
+          {viewMode === "compact" && sorted.length > 0 && (
+            <div style={styles.compactHead}>
+              <span />
+              <span>episode</span>
+              <span>task</span>
+              <span>status</span>
+              <span>takes</span>
+              <span>duration</span>
+              <span>size</span>
+            </div>
+          )}
           {sorted.length === 0 && (
             <div style={styles.empty}>
               {search || filter !== "all" ? "No matches." : "No episodes yet."}
             </div>
           )}
-          {sorted.map(ep => {
-            const isSelected = selected?.episode_id === ep.episode_id;
+          <div style={viewMode === "grid" ? styles.gridList : styles.linearList}>
+            {sorted.map((ep, index) => {
+            const isInspected = selected?.episode_id === ep.episode_id;
+            const isSelected = selectedEps.has(ep.episode_id);
             const isHovered = hoveredEp === ep.episode_id;
-            const showDelete = isHovered || confirmDeleteEp === ep.episode_id;
+            const deleteEpisodeClick = (epId: string, e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (confirmDeleteEp === epId) deleteEpisode(epId);
+              else setConfirmDeleteEp(epId);
+            };
             return (
-              <div key={ep.episode_id}
-                style={{ ...styles.epRow, background: isSelected ? "#eef2ff" : "#fff" }}
-                onClick={() => { setSelected(ep); setConfirmDeleteEp(null); }}
-                onMouseEnter={() => setHoveredEp(ep.episode_id)}
-                onMouseLeave={() => setHoveredEp(null)}>
-                <input
-                  type="checkbox"
-                  checked={selectedEps.has(ep.episode_id)}
-                  onChange={() => {}}
-                  onClick={e => toggleEpSelect(ep.episode_id, e)}
-                  style={styles.checkbox}
-                />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    <span style={styles.epId}>{ep.episode_id.slice(-18)}</span>
-                    {ep.has_postprocess && (
-                      <span title="postprocess 편집 있음"
-                        style={{ fontSize: 9, background: "#dbeafe", color: "#1d4ed8", borderRadius: 3, padding: "0 4px", fontWeight: 700 }}>
-                        ✂
-                      </span>
-                    )}
-                  </div>
-                  <div style={styles.epMeta}>
-                    <StatusBadge success={ep.success} />
-                    <span style={styles.metaText}>{ep.task || "—"}</span>
-                    <span style={{ ...styles.metaText, marginLeft: "auto" }}>{ep.takes_count ?? 0}t · {fmtMb(ep.size_mb)}</span>
-                  </div>
-                </div>
-                {showDelete && (
-                  <div style={{ flexShrink: 0 }} onClick={e => e.stopPropagation()}>
-                    {confirmDeleteEp === ep.episode_id ? (
-                      <ConfirmInline
-                        label="Delete?"
-                        onConfirm={() => deleteEpisode(ep.episode_id)}
-                        onCancel={() => setConfirmDeleteEp(null)}
-                      />
-                    ) : (
-                      <button
-                        onClick={e => { e.stopPropagation(); setConfirmDeleteEp(ep.episode_id); }}
-                        style={styles.deleteBtn}>✕</button>
-                    )}
-                  </div>
-                )}
-              </div>
+              <EpisodeCollectionItem
+                key={ep.episode_id}
+                ep={ep}
+                index={index}
+                viewMode={viewMode}
+                inspected={isInspected}
+                selected={isSelected}
+                hovered={isHovered}
+                onClick={handleEpisodeClick}
+                onCheck={toggleEpSelect}
+                onHover={setHoveredEp}
+                onDelete={deleteEpisodeClick}
+              />
             );
           })}
+          </div>
         </div>
 
         {/* Detail panel */}
-        {selected ? (
+        {selectedEps.size > 1 ? (
+          <div style={styles.detailPanel}>
+            <BatchInspector
+              episodes={selectedBatch}
+              status={batchStatus}
+              onClear={() => setSelectedEps(new Set())}
+              onExport={() => setExportModal(true)}
+            />
+          </div>
+        ) : selected ? (
           <div style={styles.detailPanel}>
             {/* Episode header */}
             <div style={{ marginBottom: 10 }}>
@@ -791,134 +985,238 @@ export default function DatasetPage() {
               <div style={{ fontSize: 12, color: "#9ca3af", marginBottom: 10 }}>No takes recorded.</div>
             )}
 
-            {/* Video + Joint Plot — 2-column grid */}
-            <div style={styles.mediaGrid}>
-              {/* Left: Video */}
-              <div style={styles.mediaCell}>
-                <div style={styles.sectionLabel}>Video</div>
-                {currentTake ? (
-                  <>
-                    <div style={{ display: "flex", gap: 3, marginBottom: 6, flexWrap: "wrap" as const }}>
-                      {[
-                        { id: "color" as const, label: "Color", avail: currentTake.has_video },
-                        { id: "depth" as const, label: "Depth", avail: currentTake.has_video },
-                        { id: "webcam_0" as const, label: "Cam0", avail: currentTake.has_webcam_0 },
-                        { id: "webcam_1" as const, label: "Cam1", avail: currentTake.has_webcam_1 },
-                      ].filter(v => v.avail).map(v => (
-                        <button key={v.id} onClick={() => setVideoSource(v.id)}
-                          style={{ ...styles.tabBtn, background: videoSource === v.id ? "#6366f1" : "#f1f5f9", color: videoSource === v.id ? "#fff" : "#374151" }}>
-                          {v.label}
-                        </button>
-                      ))}
-                    </div>
-                    {videoUrl ? (
-                      <video key={videoUrl} ref={videoRef} controls
-                        onLoadedMetadata={() => setVideoDuration(videoRef.current?.duration)}
-                        onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
-                        style={{ width: "100%", borderRadius: 6, background: "#000", display: "block" }}>
-                        <source src={videoUrl} type="video/mp4" />
-                      </video>
-                    ) : (
-                      <div style={plotStyles.empty}>No video available</div>
-                    )}
-                  </>
-                ) : (
-                  <div style={plotStyles.empty}>No take selected</div>
-                )}
-              </div>
-
-              {/* Right: Joint Plot */}
-              <div style={styles.mediaCell}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
-                  <div style={styles.sectionLabel}>Joint Plot</div>
-                  <div style={{ display: "flex", gap: 3 }}>
-                    {(["teach", "executed", "command"] as const).map(src => (
-                      <button key={src} onClick={() => setJointSource(src)}
-                        style={{ ...styles.tabBtn, background: jointSource === src ? "#334155" : "#f1f5f9", color: jointSource === src ? "#fff" : "#374151" }}>
-                        {src}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" as const, marginBottom: 4 }}>
-                  {JOINT_LABELS.map((lbl, i) => (
-                    <span key={lbl} style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 10, color: "#374151" }}>
-                      <span style={{ width: 14, height: 2.5, background: JOINT_COLORS[i], borderRadius: 1, display: "inline-block" }} />
-                      {lbl}
-                    </span>
-                  ))}
-                  <span style={{ fontSize: 10, color: "#22c55e" }}>▲ open</span>
-                  <span style={{ fontSize: 10, color: "#ef4444" }}>▲ close</span>
-                </div>
-                {jointsLoading ? (
-                  <div style={plotStyles.empty}>Loading…</div>
-                ) : jointsData ? (
-                  <JointPlot data={jointsData} source={jointSource} />
-                ) : (
-                  <div style={plotStyles.empty}>No joint data</div>
-                )}
-              </div>
+            <div style={styles.inspectorTabs}>
+              {([
+                ["preview", "Preview"],
+                ["trajectory", "Trajectory"],
+                ["postprocess", "Postprocess"],
+                ["export", "Export"],
+              ] as Array<[InspectorTab, string]>).map(([tab, label]) => (
+                <button
+                  key={tab}
+                  onClick={() => setInspectorTab(tab)}
+                  style={{
+                    ...styles.inspectorTabBtn,
+                    background: inspectorTab === tab ? "#4f46e5" : "#f8fafc",
+                    color: inspectorTab === tab ? "#fff" : "#475569",
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
 
-            {/* Postprocess panel — above trajectory so video is visible while editing */}
-            {editMeta !== null && (
-              <EditPanel
-                editMeta={editMeta}
-                autoGripperOpenT={autoGripperOpenT}
-                episodeId={selectedId!}
-                take={selectedTake!}
+            <div style={styles.workspaceGrid}>
+              <VideoPane
+                tabs={cameraTabs}
+                videoSource={videoSource}
+                videoUrl={videoUrl}
                 currentTime={currentTime}
-                duration={videoDuration}
-                onSave={meta => {
-                  saveEditMeta(meta);
-                  // update has_postprocess flag locally
-                  const hasAny = meta.trim.enabled || meta.mask.enabled;
-                  setEpisodes(prev => prev.map(e =>
-                    e.episode_id === selectedId ? { ...e, has_postprocess: hasAny } : e
-                  ));
-                  setSelected(prev => prev?.episode_id === selectedId
-                    ? { ...prev, has_postprocess: hasAny } : prev);
-                }}
+                loop={inspectorTab === "trajectory"}
+                postprocessMode={inspectorTab === "postprocess"}
+                maskEnabled={!!editMeta?.mask.enabled}
+                maskCameraId={inspectorTab === "postprocess" ? postprocessMaskCameraId : (editMeta?.mask.camera_id || undefined)}
+                onVideoSourceChange={handleVideoSourceChange}
+                onMaskCameraChange={setPostprocessMaskCameraId}
+                onLoadedMetadata={setVideoDuration}
+                onTimeUpdate={setCurrentTime}
               />
-            )}
 
-            {/* Trajectory views */}
-            {(trajectoryData || trajLoading) && (
-              <div style={{ marginTop: 14 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                  <div style={styles.sectionLabel}>Trajectory</div>
-                  {trajectoryData && (
-                    <span style={{ fontSize: 10, color: "#94a3b8" }}>
-                      {trajectoryData[jointSource].length} pts · scrub video to move cursor
-                    </span>
-                  )}
-                </div>
-                {trajLoading ? (
-                  <div style={plotStyles.empty}>Computing FK…</div>
-                ) : trajectoryData && (
-                  <div style={styles.trajGrid}>
-                    <div style={styles.mediaCell}>
-                      <div style={styles.sectionLabel}>Plan View (XY)</div>
-                      <TrajectoryPlanView
-                        samples={trajectoryData[jointSource]}
-                        currentTime={currentTime}
-                      />
-                    </div>
-                    <div style={styles.mediaCell}>
-                      <div style={styles.sectionLabel}>Side View (reach-Z)</div>
-                      <TrajectorySideView
-                        samples={trajectoryData[jointSource]}
-                        currentTime={currentTime}
-                      />
+              {inspectorTab === "preview" && (
+                <>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Episode Summary</div>
+                    <div style={styles.workspaceCellBody}>
+                      <div style={styles.summaryGrid}>
+                        <SummaryItem label="Status" value={statusLabel(selected.success)} />
+                        <SummaryItem label="Takes" value={String(selected.takes_count ?? 0)} />
+                        <SummaryItem label="Duration" value={fmtDuration(selected.duration_s ?? duration)} />
+                        <SummaryItem label="Size" value={fmtMb(selected.size_mb)} />
+                        <SummaryItem label="Created" value={fmtDate(selected.created_at)} />
+                        <SummaryItem label="Postprocess" value={selected.has_postprocess ? "Enabled" : "None"} />
+                      </div>
                     </div>
                   </div>
-                )}
-              </div>
-            )}
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Data Completeness</div>
+                    <div style={styles.workspaceCellBody}>
+                      <CompletenessChips ep={selected} />
+                    </div>
+                  </div>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Export Readiness</div>
+                    <div style={styles.workspaceCellBody}>
+                      <div style={styles.exportReadyText}>
+                        {selected.completeness?.cam0 && selected.completeness?.cam1
+                          ? "Default LeRobot export has cam0 + cam1 available."
+                          : "Check camera completeness before default LeRobot export."}
+                      </div>
+                      <button
+                        style={styles.exportBarBtn}
+                        onClick={() => {
+                          setSelectedEps(new Set([selected.episode_id]));
+                          setExportModal(true);
+                        }}
+                      >
+                        Export Episode
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {inspectorTab === "trajectory" && (
+                <>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>
+                      <span>Joint Plot</span>
+                      <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
+                        {(["teach", "executed", "command"] as const).map(src => (
+                          <button key={src} onClick={() => setJointSource(src)}
+                            style={{ ...styles.tabBtn, background: jointSource === src ? "#334155" : "#f1f5f9", color: jointSource === src ? "#fff" : "#374151" }}>
+                            {src}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={styles.trajCellBody}>
+                      {jointsLoading ? (
+                        <div style={plotStyles.empty}>Loading...</div>
+                      ) : remappedJointsData ? (
+                        <JointPlot data={remappedJointsData} source={jointSource} currentTime={currentTime} />
+                      ) : (
+                        <div style={plotStyles.empty}>No joint data</div>
+                      )}
+                    </div>
+                  </div>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Robot Pose · {jointSource}</div>
+                    <div style={styles.trajCellBody}>
+                      {remappedJointsData?.[jointSource]?.length ? (
+                        <PiperRobotViewer samples={remappedJointsData[jointSource]} currentTime={currentTime} />
+                      ) : (
+                        <div style={plotStyles.empty}>No robot pose data</div>
+                      )}
+                    </div>
+                  </div>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>
+                      <span>2D View</span>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {(["plan", "side"] as const).map(v => (
+                          <button key={v} onClick={() => setView2D(v)}
+                            style={{ ...styles.tabBtn, fontSize: 10,
+                              background: view2D === v ? "#4f46e5" : "#f1f5f9",
+                              color: view2D === v ? "#fff" : "#374151" }}>
+                            {v === "plan" ? "Plan XY" : "Side Reach-Z"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={styles.trajCellBody}>
+                      {trajectoryData ? (
+                        view2D === "plan" ? (
+                          <TrajectoryPlanView samples={trajectoryData[jointSource]} currentTime={currentTime} />
+                        ) : (
+                          <TrajectorySideView samples={trajectoryData[jointSource]} currentTime={currentTime} />
+                        )
+                      ) : (
+                        <div style={plotStyles.empty}>{nearestSample ? "Loading..." : "No trajectory data"}</div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {inspectorTab === "postprocess" && editMeta !== null && (
+                <>
+                  <div style={styles.workspaceWide}>
+                    <EditPanel
+                      editMeta={editMeta}
+                      autoGripperOpenT={autoGripperOpenT}
+                      episodeId={selectedId!}
+                      take={selectedTake!}
+                      currentTime={currentTime}
+                      duration={videoDuration}
+                      selectedMaskCameraId={postprocessMaskCameraId}
+                      onSave={meta => {
+                        saveEditMeta(meta);
+                        const hasAny = meta.trim.enabled || meta.mask.enabled;
+                        setEpisodes(prev => prev.map(e =>
+                          e.episode_id === selectedId ? { ...e, has_postprocess: hasAny } : e
+                        ));
+                        setSelected(prev => prev?.episode_id === selectedId
+                          ? { ...prev, has_postprocess: hasAny } : prev);
+                      }}
+                    />
+                  </div>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Mask Target</div>
+                    <div style={styles.workspaceCellBody}>
+                      <div style={styles.exportReadyText}>
+                        Select an RGB camera in the video pane to choose where the mask is applied. Depth is reference-only.
+                      </div>
+                      <SummaryItem label="Current target" value={postprocessMaskCameraId} />
+                      <SummaryItem label="Current time" value={fmtDuration(currentTime)} />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {inspectorTab === "export" && (
+                <>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Export Options</div>
+                    <div style={styles.workspaceCellBody}>
+                      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12, color: "#475569" }}>
+                        <input type="checkbox" checked={includeFrames} onChange={e => setIncludeFrames(e.target.checked)} />
+                        Include raw frames
+                      </label>
+                      <label style={{ display: "grid", gap: 5, marginTop: 10, fontSize: 12, color: "#475569" }}>
+                        LeRobot preset
+                        <select value={lerobotPreset} onChange={e => setLerobotPreset(e.target.value as "default" | "all" | "debug")}
+                          style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid #cbd5e1", fontSize: 12 }}>
+                          <option value="default">default · cam0 + cam1</option>
+                          <option value="all">all · export-enabled RGB cameras</option>
+                          <option value="debug">debug · cam0 + cam1 + depth sensor RGB</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Selected Take</div>
+                    <div style={styles.workspaceCellBody}>
+                      <SummaryItem label="Take" value={selectedTake ?? "-"} />
+                      <SummaryItem label="Duration" value={fmtDuration(duration)} />
+                      <SummaryItem label="Size" value={fmtMb(currentTake?.size_mb)} />
+                    </div>
+                  </div>
+                  <div style={styles.workspaceCell}>
+                    <div style={styles.trajCellHeader}>Action</div>
+                    <div style={styles.workspaceCellBody}>
+                      <button
+                        style={styles.exportBarBtn}
+                        onClick={() => {
+                          setSelectedEps(new Set([selected.episode_id]));
+                          setExportModal(true);
+                        }}
+                      >
+                        Export Episode
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
 
           </div>
         ) : (
-          <div style={styles.noSelection}>Select an episode to view details</div>
+          <EmptyInspector
+            episodes={episodes}
+            totalTakes={totalTakes}
+            totalSize={totalSize}
+            onFilter={setFilter}
+          />
         )}
       </div>
     </div>
@@ -928,7 +1226,7 @@ export default function DatasetPage() {
 // ── EditPanel ─────────────────────────────────────────────────────────────
 
 function EditPanel({
-  editMeta, autoGripperOpenT, episodeId, take, currentTime, duration, onSave,
+  editMeta, autoGripperOpenT, episodeId, take, currentTime, duration, selectedMaskCameraId, onSave,
 }: {
   editMeta: EditMeta;
   autoGripperOpenT: number | null;
@@ -936,41 +1234,43 @@ function EditPanel({
   take: string;
   currentTime: number;
   duration?: number;
+  selectedMaskCameraId: string;
   onSave: (m: EditMeta) => void;
 }) {
-  const [open, setOpen] = React.useState(false);
   const [trim, setTrim] = React.useState(editMeta.trim);
   const [mask, setMask] = React.useState(editMeta.mask);
   const [dirty, setDirty] = React.useState(false);
 
   // editMeta prop이 바뀌면(take 전환) 로컬 상태 동기화
   React.useEffect(() => { setTrim(editMeta.trim); setMask(editMeta.mask); setDirty(false); }, [editMeta]);
+  React.useEffect(() => {
+    if (!selectedMaskCameraId) return;
+    const current = mask.camera_id || "cam1";
+    if (current === selectedMaskCameraId) return;
+    setMask(p => ({ ...p, camera_id: selectedMaskCameraId, polygon: [] }));
+    setDirty(true);
+  }, [selectedMaskCameraId, mask.camera_id]);
 
   const effectiveCutT = trim.cut_t ?? autoGripperOpenT;
   const trimEnd = effectiveCutT !== null ? effectiveCutT + trim.margin : null;
+  const targetCamera = mask.camera_id || selectedMaskCameraId || "cam1";
 
   const save = () => { onSave({ trim, mask }); setDirty(false); };
 
   return (
-    <div style={{ marginTop: 16, border: "1px solid #e2e8f0", borderRadius: 8, overflow: "hidden" }}>
-      {/* 헤더 */}
-      <button
-        onClick={() => setOpen(v => !v)}
-        style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
-          padding: "8px 12px", background: "#f8fafc", border: "none", cursor: "pointer",
-          fontSize: 12, fontWeight: 700, color: "#475569" }}
-      >
-        <span>✂ Export 편집 옵션</span>
+    <div style={{ height: "100%", minHeight: 0, border: "1px solid #e2e8f0", borderRadius: 10, overflow: "hidden", background: "#fff", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 14px", borderBottom: "1px solid #f1f5f9", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 800, color: "#1e293b" }}>Export edit options</div>
+          <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 2 }}>Trim and mask settings applied during export.</div>
+        </div>
         <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          {trim.enabled && <span style={{ background: "#dbeafe", color: "#1d4ed8", borderRadius: 4, padding: "1px 6px" }}>Trim ON</span>}
-          {mask.enabled && <span style={{ background: "#d1fae5", color: "#065f46", borderRadius: 4, padding: "1px 6px" }}>Mask ON</span>}
-          {dirty && <span style={{ color: "#ef4444", fontSize: 10 }}>●</span>}
-          <span>{open ? "▲" : "▼"}</span>
+          {trim.enabled && <span style={{ background: "#dbeafe", color: "#1d4ed8", borderRadius: 4, padding: "1px 6px", fontSize: 11, fontWeight: 700 }}>Trim ON</span>}
+          {mask.enabled && <span style={{ background: "#d1fae5", color: "#065f46", borderRadius: 4, padding: "1px 6px", fontSize: 11, fontWeight: 700 }}>Mask ON</span>}
+          {dirty && <span style={{ color: "#ef4444", fontSize: 11, fontWeight: 800 }}>Unsaved</span>}
         </span>
-      </button>
-
-      {open && (
-        <div style={{ padding: "12px 14px", background: "#fff" }}>
+      </div>
+      <div style={{ padding: "12px 14px", background: "#fff", overflow: "auto", minHeight: 0 }}>
           {/* ── Trim / Mask 가로 grid ── */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, alignItems: "start", marginBottom: 12 }}>
           {/* ── Trim Editor ── */}
@@ -1058,7 +1358,7 @@ function EditPanel({
                     <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>
                       컷 지점 프레임 (joint t={trimEnd.toFixed(2)}s):
                     </div>
-                    <Webcam1Frame episodeId={episodeId} take={take} tSec={trimEnd} tBase="video" />
+                    <CameraFrame episodeId={episodeId} take={take} cameraId={targetCamera} tSec={trimEnd} tBase="video" />
                   </div>
                 )}
               </>
@@ -1068,7 +1368,10 @@ function EditPanel({
           {/* ── Mask Editor ── */}
           <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase" as const, letterSpacing: 0.7, marginBottom: 8 }}>
-              Mask (cam_webcam_1 keep 영역)
+              Video Mask
+            </div>
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>
+              Target camera follows the active RGB camera tab: <strong style={{ color: "#15803d" }}>{targetCamera}</strong>
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 8, cursor: "pointer" }}>
@@ -1083,6 +1386,7 @@ function EditPanel({
                 take={take}
                 currentTime={currentTime}
                 mask={mask}
+                cameraId={targetCamera}
                 onMaskChange={m => { setMask(m); setDirty(true); }}
               />
             )}
@@ -1099,49 +1403,102 @@ function EditPanel({
           >
             {dirty ? "저장" : "저장됨"}
           </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Shared camera frame preview ──────────────────────────────────────────
+
+function CameraFrame({
+  episodeId, take, cameraId, tSec, tBase = "video", style, onAspectRatio,
+}: {
+  episodeId: string;
+  take: string;
+  cameraId: string;
+  tSec: number;
+  tBase?: "video" | "camera";
+  style?: React.CSSProperties;
+  onAspectRatio?: (ratio: number) => void;
+}) {
+  const [url, setUrl] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
+  const [failed, setFailed] = React.useState(false);
+  const [usedLegacyFallback, setUsedLegacyFallback] = React.useState(false);
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const makeFrameUrl = React.useCallback((legacy = false) => {
+    const t = tSec.toFixed(2);
+    const cache = Date.now();
+    if (legacy) {
+      return `/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${t}&ref=${tBase}&_=${cache}`;
+    }
+    return `/api/episodes/${episodeId}/takes/${take}/frame_camera_at/${cameraId}?t=${t}&ref=${tBase}&_=${cache}`;
+  }, [episodeId, take, cameraId, tSec, tBase]);
+
+  React.useEffect(() => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setLoading(true);  // tSec 변경 즉시 dim → 로딩 중 피드백
+    setFailed(false);
+    setUsedLegacyFallback(false);
+    timerRef.current = setTimeout(() => {
+      setUrl(makeFrameUrl(false));
+    }, 200);
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, [makeFrameUrl]);
+
+  return (
+    <div style={{ position: "relative", width: "100%", aspectRatio: "16 / 9", minHeight: 160, borderRadius: 8, overflow: "hidden", background: "#0f172a", ...style }}>
+      {url && !failed && (
+        <img
+          src={url}
+          alt={`${cameraId} @${tSec.toFixed(1)}s`}
+          onLoad={e => {
+            setLoading(false);
+            const { naturalWidth, naturalHeight } = e.currentTarget;
+            if (naturalWidth > 0 && naturalHeight > 0) {
+              onAspectRatio?.(naturalWidth / naturalHeight);
+            }
+          }}
+          onError={() => {
+            const canFallback = !usedLegacyFallback && (cameraId === "cam1" || cameraId === "webcam_1");
+            if (canFallback) {
+              setUsedLegacyFallback(true);
+              setUrl(makeFrameUrl(true));
+              return;
+            }
+            setLoading(false);
+            setFailed(true);
+          }}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            display: "block",
+            opacity: loading ? 0.35 : 1,
+            transition: "opacity 0.15s",
+          }}
+        />
+      )}
+      {(!url || failed) && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#94a3b8", fontSize: 12, fontWeight: 800, padding: 12, textAlign: "center" }}>
+          {failed ? `No frame for ${cameraId}` : "Loading frame..."}
         </div>
       )}
     </div>
   );
 }
 
-// ── Shared webcam_1 frame preview ────────────────────────────────────────
-
-function Webcam1Frame({
-  episodeId, take, tSec, tBase = "video", style,
-}: { episodeId: string; take: string; tSec: number; tBase?: "video" | "camera"; style?: React.CSSProperties }) {
-  const [url, setUrl] = React.useState("");
-  const [loading, setLoading] = React.useState(false);
-  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  React.useEffect(() => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setLoading(true);  // tSec 변경 즉시 dim → 로딩 중 피드백
-    timerRef.current = setTimeout(() => {
-      setUrl(`/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${tSec.toFixed(2)}&ref=${tBase}&_=${Date.now()}`);
-    }, 200);
-    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
-  }, [episodeId, take, tSec, tBase]);
-
-  if (!url) return null;
-  return (
-    <img src={url} alt={`webcam_1 @${tSec.toFixed(1)}s`}
-      onLoad={() => setLoading(false)}
-      onError={() => setLoading(false)}
-      style={{ width: "100%", borderRadius: 5, display: "block", background: "#000",
-               opacity: loading ? 0.35 : 1, transition: "opacity 0.15s", ...style }} />
-  );
-}
-
 // ── Mask Polygon Editor ───────────────────────────────────────────────────
 
 function MaskPolygonEditor({
-  episodeId, take, currentTime, mask, onMaskChange,
+  episodeId, take, currentTime, mask, cameraId, onMaskChange,
 }: {
   episodeId: string;
   take: string;
   currentTime: number;
   mask: MaskMeta;
+  cameraId: string;
   onMaskChange: (m: MaskMeta) => void;
 }) {
   const polygon = mask.polygon;
@@ -1149,6 +1506,7 @@ function MaskPolygonEditor({
   const [library, setLibrary] = React.useState<MaskLibraryEntry[]>([]);
   const [saveName, setSaveName] = React.useState("");
   const [showLib, setShowLib] = React.useState(false);
+  const [frameAspect, setFrameAspect] = React.useState(16 / 9);
 
   const loadLibrary = React.useCallback(() => {
     fetch("/api/masks").then(r => r.json()).then(setLibrary).catch(() => {});
@@ -1168,10 +1526,17 @@ function MaskPolygonEditor({
   };
 
   // 프레임 캡쳐 마스크: 캡쳐 기준 프레임 URL
+  const frameUrl = React.useCallback((t: number) => {
+    const endpoint = cameraId === "cam1" || cameraId === "webcam_1"
+      ? "frame_webcam1_at"
+      : `frame_camera_at/${cameraId}`;
+    return `/api/episodes/${episodeId}/takes/${take}/${endpoint}?t=${t.toFixed(2)}&ref=video`;
+  }, [episodeId, take, cameraId]);
+
   const captureFrameUrl = React.useMemo(() => {
     if (mask.fill !== "frame_capture" || mask.capture_t === undefined) return "";
-    return `/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${mask.capture_t.toFixed(2)}&ref=video`;
-  }, [episodeId, take, mask.fill, mask.capture_t]);
+    return frameUrl(mask.capture_t);
+  }, [frameUrl, mask.fill, mask.capture_t]);
 
   const deleteFromLibrary = (id: string) => {
     fetch(`/api/masks/${id}`, { method: "DELETE" })
@@ -1240,10 +1605,32 @@ function MaskPolygonEditor({
       </div>
 
       {/* 프레임 + SVG 오버레이 (실제 export 결과 미리보기) */}
-      <div style={{ position: "relative", background: "#000", borderRadius: 6, overflow: "hidden", marginBottom: 8 }}>
+      <div style={{
+        position: "relative",
+        width: "100%",
+        aspectRatio: `${frameAspect}`,
+        background: "#000",
+        borderRadius: 8,
+        overflow: "hidden",
+        marginBottom: 8,
+      }}>
         {/* 레이어 1: 현재 프레임 (keep 영역의 실제 비디오) */}
-        <Webcam1Frame episodeId={episodeId} take={take} tSec={currentTime}
-          style={{ opacity: showMask && mask.fill === "black" ? 0.6 : 1 }} />
+        <CameraFrame
+          episodeId={episodeId}
+          take={take}
+          cameraId={cameraId}
+          tSec={currentTime}
+          onAspectRatio={setFrameAspect}
+          style={{
+            position: "absolute",
+            inset: 0,
+            height: "100%",
+            minHeight: 0,
+            aspectRatio: "auto",
+            borderRadius: 0,
+            opacity: showMask && mask.fill === "black" ? 0.6 : 1,
+          }}
+        />
 
         {/* 레이어 2 + 3: SVG — 마스크 미리보기 + 폴리곤 편집 */}
         <svg viewBox="0 0 1 1" preserveAspectRatio="none"
@@ -1359,70 +1746,6 @@ function MaskPolygonEditor({
   );
 }
 
-// ── Export Modal ──────────────────────────────────────────────────────────
-
-function ExportModal({ count, exporting, exportingLerobot, includeFrames, onIncludeFrames, onExportZip, onExportLerobot, onClose }: {
-  count: number;
-  exporting: boolean;
-  exportingLerobot: boolean;
-  includeFrames: boolean;
-  onIncludeFrames: (v: boolean) => void;
-  onExportZip: () => void;
-  onExportLerobot: () => void;
-  onClose: () => void;
-}) {
-  return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000,
-      display: "flex", alignItems: "center", justifyContent: "center" }}
-      onClick={onClose}>
-      <div style={{ background: "#fff", borderRadius: 12, padding: "24px 28px", minWidth: 320,
-        boxShadow: "0 20px 40px rgba(0,0,0,0.15)" }}
-        onClick={e => e.stopPropagation()}>
-        <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 700, color: "#1e293b" }}>
-          Export Dataset
-        </h3>
-        <div style={{ fontSize: 13, color: "#64748b", marginBottom: 16 }}>
-          {count}개 에피소드 선택됨
-        </div>
-
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#374151", cursor: "pointer", marginBottom: 20 }}>
-          <input type="checkbox" checked={includeFrames} onChange={e => onIncludeFrames(e.target.checked)} />
-          Raw 프레임 이미지 포함 (용량 큼)
-        </label>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <button onClick={() => { onExportZip(); onClose(); }} disabled={exporting}
-            style={{ padding: "10px 16px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700,
-              background: "#6366f1", color: "#fff", cursor: "pointer", textAlign: "left" }}>
-            {exporting ? "압축 중…" : "↓ Basic ZIP (원본 형식)"}
-            <div style={{ fontSize: 10, fontWeight: 400, opacity: 0.8, marginTop: 2 }}>CSV + 비디오 + 메타데이터</div>
-          </button>
-          <button onClick={() => { onExportLerobot(); onClose(); }} disabled={exportingLerobot}
-            style={{ padding: "10px 16px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700,
-              background: "#059669", color: "#fff", cursor: "pointer", textAlign: "left" }}>
-            {exportingLerobot ? "변환 중…" : "↓ LeRobot v2.0 ZIP"}
-            <div style={{ fontSize: 10, fontWeight: 400, opacity: 0.8, marginTop: 2 }}>224×224 @ 15fps · parquet · postprocess 적용</div>
-          </button>
-        </div>
-
-        <button onClick={onClose}
-          style={{ marginTop: 16, width: "100%", padding: "8px", borderRadius: 8, border: "1px solid #e5e7eb",
-            background: "#fff", fontSize: 12, color: "#64748b", cursor: "pointer" }}>
-          취소
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function StatusBadge({ success }: { success: boolean | null | undefined }) {
-  if (success === null || success === undefined)
-    return <span style={{ ...styles.badge, background: "#f1f5f9", color: "#6b7280" }}>?</span>;
-  if (success)
-    return <span style={{ ...styles.badge, background: "#dcfce7", color: "#15803d" }}>✓</span>;
-  return <span style={{ ...styles.badge, background: "#fee2e2", color: "#dc2626" }}>✗</span>;
-}
-
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", height: "100%", gap: 0 },
   header: {
@@ -1439,11 +1762,21 @@ const styles: Record<string, React.CSSProperties> = {
   },
   filterBtn: { padding: "3px 10px", border: "none", borderRadius: 5, fontSize: 11, fontWeight: 700, cursor: "pointer" },
   refreshBtn: { padding: "3px 10px", background: "#f1f5f9", border: "none", borderRadius: 5, fontSize: 14, cursor: "pointer" },
+  viewToggle: { display: "flex", border: "1px solid #e5e7eb", borderRadius: 6, overflow: "hidden" },
+  viewBtn: { border: "none", padding: "4px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" },
   body: { display: "flex", flex: 1, gap: 16, minHeight: 0, overflow: "hidden" },
   listPanel: {
-    width: 300, flexShrink: 0, overflowY: "auto",
-    display: "flex", flexDirection: "column", gap: 6,
+    width: 430, flexShrink: 0, overflowY: "auto", overflowX: "hidden",
+    display: "flex", flexDirection: "column", gap: 8,
+    minWidth: 0,
   },
+  collectionHeader: {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    fontSize: 11, fontWeight: 800, color: "#64748b", textTransform: "uppercase",
+    letterSpacing: 0.8,
+  },
+  linearList: { display: "flex", flexDirection: "column", gap: 8 },
+  gridList: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 },
   detailPanel: {
     flex: 1, overflowY: "auto", background: "#fff", borderRadius: 10,
     border: "1px solid #e5e7eb", padding: 16,
@@ -1462,6 +1795,81 @@ const styles: Record<string, React.CSSProperties> = {
   epMeta: { display: "flex", alignItems: "center", gap: 6, marginTop: 2 },
   metaText: { fontSize: 10, color: "#9ca3af" },
   badge: { padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700 },
+  thumbRow: {
+    display: "flex", alignItems: "center", gap: 10,
+    border: "1px solid #e5e7eb", borderRadius: 10,
+    padding: 9, cursor: "pointer", minHeight: 98,
+  },
+  thumbTitleRow: { display: "flex", alignItems: "center", gap: 6, minWidth: 0 },
+  thumbTask: {
+    fontSize: 13, color: "#111827", fontWeight: 700, marginTop: 5,
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+  },
+  thumbMeta: { fontSize: 11, color: "#64748b", marginTop: 4 },
+  postprocessBadge: {
+    fontSize: 9, background: "#dbeafe", color: "#1d4ed8",
+    borderRadius: 3, padding: "1px 5px", fontWeight: 800,
+  },
+  rowDeleteBtn: {
+    width: 24, height: 24, borderRadius: 5, border: "none",
+    background: "#f8fafc", color: "#94a3b8", cursor: "pointer",
+    fontSize: 16, lineHeight: 1, flexShrink: 0,
+  },
+  videoThumb: {
+    position: "relative",
+    width: 104, aspectRatio: "16 / 9", borderRadius: 8,
+    overflow: "hidden", background: "#0f172a", flexShrink: 0,
+    display: "flex", alignItems: "center", justifyContent: "center",
+  },
+  videoThumbMedia: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
+  videoThumbEmpty: { color: "#94a3b8", fontSize: 11, fontWeight: 700 },
+  thumbStatusOverlay: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    color: "#fff",
+    borderRadius: 4,
+    padding: "1px 5px",
+    fontSize: 9,
+    fontWeight: 900,
+    letterSpacing: 0.4,
+    lineHeight: 1.4,
+  },
+  chipRow: { display: "flex", gap: 4, flexWrap: "wrap" as const, marginTop: 6 },
+  dataChip: {
+    border: "1px solid #e2e8f0", borderRadius: 4,
+    padding: "1px 4px", fontSize: 9, fontWeight: 800,
+  },
+  compactHead: {
+    display: "grid", gridTemplateColumns: "22px minmax(0, 1.15fr) minmax(0, 1.45fr) 76px 44px 70px 78px",
+    gap: 6, alignItems: "center", padding: "0 10px",
+    color: "#94a3b8", fontSize: 10, fontWeight: 800, textTransform: "uppercase",
+    boxSizing: "border-box",
+  },
+  compactRow: {
+    display: "grid", gridTemplateColumns: "22px minmax(0, 1.15fr) minmax(0, 1.45fr) 76px 44px 70px 78px",
+    gap: 6, alignItems: "center", border: "1px solid #e5e7eb",
+    borderRadius: 8, padding: "7px 8px", cursor: "pointer",
+    boxSizing: "border-box", width: "100%", minWidth: 0,
+  },
+  compactId: { fontFamily: "monospace", fontSize: 10, color: "#4f46e5", fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  compactTask: { fontSize: 11, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  compactMeta: { fontSize: 11, color: "#64748b" },
+  gridCard: {
+    position: "relative", border: "1px solid #e5e7eb", borderRadius: 10,
+    background: "#fff", padding: 7, cursor: "pointer", minWidth: 0,
+  },
+  gridCheckbox: { position: "absolute", top: 8, left: 8, zIndex: 2, accentColor: "#6366f1" },
+  gridDeleteBtn: {
+    position: "absolute", top: 8, right: 8, zIndex: 2,
+    width: 22, height: 22, border: "none", borderRadius: 5,
+    background: "rgba(15,23,42,0.58)", color: "#fff", cursor: "pointer",
+  },
+  gridTask: {
+    fontSize: 10, fontWeight: 800, color: "#111827", marginTop: 6,
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+  },
+  gridMeta: { fontSize: 9, color: "#64748b", margin: "3px 0 4px" },
   deleteBtn: {
     background: "none", border: "none", cursor: "pointer",
     fontSize: 11, color: "#94a3b8", padding: "2px 4px",
@@ -1485,6 +1893,14 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: 1, color: "#94a3b8", fontWeight: 700, marginBottom: 4,
   },
   tabBtn: { padding: "3px 8px", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", fontWeight: 600 },
+  inspectorTabs: {
+    display: "flex", gap: 6, borderTop: "1px solid #f1f5f9",
+    paddingTop: 10, marginTop: 10,
+  },
+  inspectorTabBtn: {
+    border: "1px solid #e5e7eb", borderRadius: 6,
+    padding: "6px 12px", fontSize: 12, fontWeight: 800, cursor: "pointer",
+  },
   noSelection: {
     flex: 1, display: "flex", alignItems: "center",
     justifyContent: "center", color: "#94a3b8", fontSize: 14,
@@ -1496,14 +1912,127 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: 12,
     alignItems: "start",
   },
-  trajGrid: {
-    display: "grid",
-    gridTemplateColumns: "1fr 1fr",
-    gap: 14,
-    alignItems: "start",
-  },
   mediaCell: {
     minWidth: 0,
+    minHeight: 0,
+  },
+  workspaceGrid: {
+    display: "grid",
+    gridTemplateColumns: "minmax(360px, 1fr) minmax(320px, 1fr)",
+    gridTemplateRows: "minmax(240px, 0.9fr) minmax(280px, 1.1fr)",
+    gap: 10,
+    height: "calc(100vh - 245px)",
+    minHeight: 560,
+    marginTop: 10,
+    overflow: "hidden",
+  },
+  workspaceCell: {
+    minWidth: 0,
+    minHeight: 0,
+    overflow: "hidden",
+    border: "1px solid #e5e7eb",
+    borderRadius: 10,
+    background: "#fff",
+    display: "flex",
+    flexDirection: "column",
+  },
+  workspaceCellBody: {
+    flex: "1 1 auto",
+    minHeight: 0,
+    overflow: "auto",
+    padding: 10,
+  },
+  workspaceWide: {
+    gridColumn: "2 / 3",
+    gridRow: "1 / 3",
+    minWidth: 0,
+    minHeight: 0,
+    overflow: "hidden",
+  },
+  exportReadyText: {
+    fontSize: 13,
+    lineHeight: 1.5,
+    color: "#475569",
+    marginBottom: 12,
+  },
+  trajectoryTab: {
+    display: "flex",
+    flexDirection: "column",
+    height: "calc(100vh - 230px)",
+    minHeight: 400,
+    overflow: "hidden",
+    marginTop: 8,
+    gap: 8,
+  },
+  trajectoryToolbar: {
+    flex: "0 0 auto",
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+  },
+  trajectoryGrid: {
+    flex: "1 1 auto",
+    minHeight: 0,
+    display: "grid",
+    gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)",
+    gridTemplateRows: "minmax(0,1fr) minmax(0,1fr)",
+    gap: 10,
+    overflow: "hidden",
+  },
+  trajCell: {
+    minWidth: 0,
+    minHeight: 0,
+    overflow: "hidden",
+    border: "1px solid #e5e7eb",
+    borderRadius: 10,
+    background: "#fff",
+    display: "flex",
+    flexDirection: "column",
+  },
+  trajCellHeader: {
+    flex: "0 0 auto",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "5px 10px",
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#64748b",
+    letterSpacing: "0.05em",
+    textTransform: "uppercase",
+    borderBottom: "1px solid #f1f5f9",
+  },
+  trajCellBody: {
+    flex: "1 1 auto",
+    minHeight: 0,
+    overflow: "hidden",
+    position: "relative",
+  },
+  summaryGrid: {
+    display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 8,
+  },
+  summaryItem: {
+    border: "1px solid #e5e7eb", borderRadius: 8,
+    padding: "9px 10px", background: "#f8fafc",
+  },
+  summaryLabel: { display: "block", fontSize: 10, color: "#94a3b8", fontWeight: 800, textTransform: "uppercase" },
+  summaryValue: { display: "block", fontSize: 13, color: "#111827", fontWeight: 800, marginTop: 4 },
+  emptyHero: { fontSize: 18, color: "#111827", fontWeight: 900, marginBottom: 14 },
+  quickFilters: { display: "flex", gap: 8, flexWrap: "wrap" as const, marginTop: 16 },
+  quickFilterBtn: {
+    border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff",
+    color: "#4f46e5", fontSize: 12, fontWeight: 800, padding: "8px 10px", cursor: "pointer",
+  },
+  batchTaskRow: {
+    display: "flex", justifyContent: "space-between", gap: 12,
+    borderBottom: "1px solid #f1f5f9", padding: "7px 0",
+    fontSize: 13, color: "#374151",
+  },
+  batchActions: { display: "flex", gap: 8, marginTop: 16 },
+  exportInspector: {
+    marginTop: 12, border: "1px solid #e5e7eb",
+    borderRadius: 10, padding: 16, background: "#f8fafc",
   },
   taskInput: {
     flex: 1, padding: "3px 8px", borderRadius: 6,

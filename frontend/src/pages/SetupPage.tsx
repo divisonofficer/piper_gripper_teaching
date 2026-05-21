@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import type { RobotState } from "../types";
+import type { CameraManifest, CameraManifestEntry, RobotState } from "../types";
 
 interface Props {
   robot: RobotState;
@@ -13,8 +13,12 @@ export default function SetupPage({ robot }: Props) {
   const [saving, setSaving] = useState(false);
   const [recording, setRecording] = useState(false);
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [cameraManifest, setCameraManifest] = useState<CameraManifest | null>(null);
+  const [savedCameraManifest, setSavedCameraManifest] = useState<CameraManifest | null>(null);
+  const [savingCameras, setSavingCameras] = useState(false);
 
   const isDirty = JSON.stringify(waypoints) !== JSON.stringify(savedWaypoints);
+  const camerasDirty = JSON.stringify(cameraManifest) !== JSON.stringify(savedCameraManifest);
 
   const showMsg = (text: string, ok: boolean) => {
     setMsg({ text, ok });
@@ -30,6 +34,13 @@ export default function SetupPage({ robot }: Props) {
           setWaypoints(d.waypoints);
           setSavedWaypoints(d.waypoints);
         }
+      })
+      .catch(() => {});
+    fetch("/api/cameras/manifest")
+      .then(r => r.json())
+      .then((d: CameraManifest) => {
+        setCameraManifest(d);
+        setSavedCameraManifest(d);
       })
       .catch(() => {});
   }, []);
@@ -98,6 +109,39 @@ export default function SetupPage({ robot }: Props) {
     if (window.confirm("Clear all waypoints? The saved file will be overwritten on next Save.")) {
       setWaypoints([]);
     }
+  };
+
+  const updateCamera = (id: string, patch: Partial<CameraManifestEntry>) => {
+    setCameraManifest(prev => prev ? {
+      ...prev,
+      cameras: prev.cameras.map(c => c.id === id ? { ...c, ...patch } : c),
+    } : prev);
+  };
+
+  const togglePreset = (cam: CameraManifestEntry, preset: "default" | "all" | "debug") => {
+    updateCamera(cam.id, {
+      export_presets: cam.export_presets.includes(preset)
+        ? cam.export_presets.filter(p => p !== preset)
+        : [...cam.export_presets, preset],
+    });
+  };
+
+  const saveCameraManifest = () => {
+    if (!cameraManifest) return;
+    setSavingCameras(true);
+    fetch("/api/cameras/manifest", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cameraManifest),
+    })
+      .then(r => r.json())
+      .then((d: CameraManifest) => {
+        setCameraManifest(d);
+        setSavedCameraManifest(d);
+        showMsg("Camera manifest saved", true);
+      })
+      .catch(() => showMsg("Camera manifest save failed", false))
+      .finally(() => setSavingCameras(false));
   };
 
   // 현재 로봇 위치 (실시간 표시용)
@@ -214,6 +258,51 @@ export default function SetupPage({ robot }: Props) {
         <p style={styles.guideNote}>
           Tip: waypoints are executed in top-to-bottom order. If a waypoint is not reached within timeout, the return motion aborts at that position.
         </p>
+      </div>
+
+      <div style={styles.cameraSection}>
+        <h2 style={styles.title}>Camera Manifest</h2>
+        <p style={styles.desc}>
+          Camera roles keep the dataset contract stable: cam0 is ego view, cam1 is overview, RealSense is the depth sensor.
+        </p>
+        {!cameraManifest ? (
+          <div style={styles.empty}>Camera manifest unavailable.</div>
+        ) : (
+          <div style={styles.cameraList}>
+            {cameraManifest.cameras.map(cam => (
+              <div key={cam.id} style={styles.cameraRow}>
+                <div>
+                  <div style={styles.camId}>{cam.id}</div>
+                  <div style={styles.camRole}>{cam.role} · {cam.type}</div>
+                  <div style={styles.camRole}>legacy: {cam.legacy_id}</div>
+                </div>
+                <label style={styles.checkboxLabel}>
+                  <input type="checkbox" checked={cam.enabled} onChange={e => updateCamera(cam.id, { enabled: e.target.checked })} />
+                  enabled
+                </label>
+                <input value={cam.label} onChange={e => updateCamera(cam.id, { label: e.target.value })}
+                  style={styles.cameraInput} placeholder="Label" />
+                <input value={cam.device} onChange={e => updateCamera(cam.id, { device: e.target.value })}
+                  style={styles.cameraInput} placeholder="/dev/video4 or auto:C270:0" />
+                <div style={styles.presetGroup}>
+                  {(["default", "all", "debug"] as const).map(p => (
+                    <label key={p} style={styles.presetChip}>
+                      <input type="checkbox" checked={cam.export_presets.includes(p)} onChange={() => togglePreset(cam, p)} />
+                      {p}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        <button
+          style={{ ...styles.saveBtn, opacity: (!camerasDirty || savingCameras) ? 0.5 : 1 }}
+          onClick={saveCameraManifest}
+          disabled={!camerasDirty || savingCameras}
+        >
+          {savingCameras ? "Saving..." : "Save Camera Manifest"}
+        </button>
       </div>
     </div>
   );
@@ -337,4 +426,28 @@ const styles: Record<string, React.CSSProperties> = {
   guideTitle: { fontWeight: 700, fontSize: 13, color: "#374151", marginBottom: 8 },
   guideList: { fontSize: 13, color: "#4b5563", lineHeight: 2, paddingLeft: 20, margin: 0 },
   guideNote: { fontSize: 12, color: "#94a3b8", marginTop: 10, marginBottom: 0 },
+
+  cameraSection: {
+    marginTop: 24,
+    background: "#fff",
+    border: "1px solid #e5e7eb",
+    borderRadius: 10,
+    padding: 16,
+  },
+  cameraList: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 },
+  cameraRow: {
+    display: "grid",
+    gridTemplateColumns: "110px 90px 1fr 1.4fr 210px",
+    gap: 8,
+    alignItems: "center",
+    padding: 10,
+    border: "1px solid #eef2f7",
+    borderRadius: 8,
+  },
+  camId: { fontSize: 13, fontWeight: 800, color: "#1e293b" },
+  camRole: { fontSize: 10, color: "#94a3b8", marginTop: 2 },
+  checkboxLabel: { display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "#475569" },
+  cameraInput: { padding: "6px 8px", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: 12 },
+  presetGroup: { display: "flex", gap: 6, flexWrap: "wrap" as const },
+  presetChip: { display: "flex", alignItems: "center", gap: 3, fontSize: 11, color: "#475569" },
 };

@@ -6,7 +6,8 @@
  * Row C: Event Log    — 최근 이벤트 스트립 (최대 5줄)
  */
 import React, { useState, useEffect, useMemo } from "react";
-import type { AppMode, RobotState, CameraState, EventLog } from "../types";
+import ReviewEpisodeModal from "../components/ReviewEpisodeModal";
+import type { AppMode, RobotState, CameraState, EventLog, SaveStep } from "../types";
 
 interface Props {
   mode: AppMode;
@@ -14,19 +15,14 @@ interface Props {
   robot: RobotState;
   camera: CameraState;
   events: EventLog[];
+  episodeId?: string;
+  saveSteps?: SaveStep[];
 }
 
 // Flask HTTP stream (webpack 프록시는 MJPEG multipart를 버퍼링해 끊길 수 있음)
 const FLASK_HTTP_ORIGIN = `http://${window.location.hostname}:5002`;
 
-const ALL_CAMERAS = [
-  { id: "realsense",       label: "RS RGB"   },
-  { id: "realsense_depth", label: "RS Depth" },
-  { id: "webcam_0",        label: "Webcam 0" },
-  { id: "webcam_1",        label: "Webcam 1" },
-] as const;
-
-type CamId = typeof ALL_CAMERAS[number]["id"];
+type CamId = string;
 
 const TEACH_DISABLE_DELAY = 5; // seconds
 
@@ -40,36 +36,40 @@ const post = (path: string, body?: object) =>
 
 // ── Step descriptor map ────────────────────────────────────────────────────
 const STEP_INFO: Record<AppMode, { badge: string; title: string; guide: string }> = {
-  IDLE:             { badge: "1 · Setup",   title: "Connect System",          guide: "Check all connections, then connect the robot and cameras." },
-  CONNECTING:       { badge: "1 · Setup",   title: "Connecting…",             guide: "Initializing robot and camera. Please wait." },
-  READY:            { badge: "1 · Setup",   title: "System Ready",            guide: "Confirm the current pose as the teaching start position." },
+  IDLE:             { badge: "1 · Ready Pose", title: "Connect System",       guide: "Check all connections, then connect the robot and cameras." },
+  CONNECTING:       { badge: "1 · Ready Pose", title: "Connecting…",          guide: "Initializing robot and camera. Please wait." },
+  READY:            { badge: "1 · Ready Pose", title: "System Ready",         guide: "Confirm the current pose as the teaching start position." },
   CALIBRATING:      { badge: "Calibration", title: "Joint Range Calibration", guide: "Move each joint to its min and max safe position, then finish." },
-  TEACH_READY:      { badge: "2 · Teach",   title: "Ready to Teach",          guide: "Describe the task, then guide the arm along the desired path." },
-  TEACH_RECORDING:  { badge: "2 · Teach",   title: "Teaching in Progress",    guide: "Motors release in 5 s. Guide the arm along the path." },
-  TRAJECTORY_CHECK: { badge: "3 · Home",    title: "Trajectory Recorded",     guide: "Return to start position before replay recording." },
-  RETURN_HOME:      { badge: "3 · Home",    title: "Returning Home",          guide: "Robot is moving to the start position. Stay clear." },
-  REPLAY_READY:     { badge: "4 · Record",  title: "Ready to Record",         guide: "Set replay speed, then start the capture." },
-  REPLAY_RECORDING: { badge: "4 · Record",  title: "Recording in Progress",   guide: "Stay away from the robot's workspace." },
-  PROCESSING:       { badge: "4 · Record",  title: "Encoding Videos…",        guide: "Replay done. Encoding and saving data, please wait." },
-  REVIEW:           { badge: "5 · Review",  title: "Episode Complete",        guide: "Switch to the Review page to label and save this episode." },
+  TEACH_READY:      { badge: "2 · Teaching", title: "Ready to Teach",         guide: "Describe the task, then guide the arm along the desired path." },
+  TEACH_RECORDING:  { badge: "2 · Teaching", title: "Teaching in Progress",   guide: "Motors release in 5 s. Guide the arm along the path." },
+  TRAJECTORY_CHECK: { badge: "3 · Return Home", title: "Trajectory Recorded", guide: "Return to start position before replay recording." },
+  RETURN_HOME:      { badge: "3 · Return Home", title: "Returning Home",      guide: "Robot is moving to the start position. Stay clear." },
+  REPLAY_READY:     { badge: "4 · Replay & Record", title: "Ready to Record", guide: "Set replay speed, then start the capture." },
+  REPLAY_RECORDING: { badge: "4 · Replay & Record", title: "Recording in Progress", guide: "Stay away from the robot's workspace." },
+  PROCESSING:       { badge: "4 · Replay & Record", title: "Encoding Videos…", guide: "Replay done. Encoding and saving data, please wait." },
+  REVIEW:           { badge: "5 · Review",  title: "Episode Complete",        guide: "Review the new take, then save, retake, or discard it." },
   SAVED:            { badge: "5 · Review",  title: "Episode Saved",           guide: "Start a new episode or add another take." },
   DISCARDED:        { badge: "5 · Review",  title: "Episode Discarded",       guide: "Start a new episode to continue." },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function CapturePage({
-  mode, availableActions, robot, camera, events,
+  mode, availableActions, robot, camera, events, episodeId, saveSteps = [],
 }: Props) {
-  const [selectedCam, setSelectedCam] = useState<CamId>("realsense");
+  const [selectedCam, setSelectedCam] = useState<CamId>("cam0");
   const [task, setTask] = useState("pick red block and place in bowl");
   const [speedScale, setSpeedScale] = useState(0.5);
   const [confirmReplay, setConfirmReplay] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [reviewDismissed, setReviewDismissed] = useState(false);
   const [calibLimits, setCalibLimits] = useState<Record<
     string, { min: number; max: number; measured?: boolean }
   > | null>(null);
 
   useEffect(() => { setIsSaving(false); }, [mode]);
+  useEffect(() => {
+    if (mode === "REVIEW" || mode === "PROCESSING") setReviewDismissed(false);
+  }, [mode]);
 
   const can = (a: string) => availableActions.includes(a);
 
@@ -93,6 +93,9 @@ export default function CapturePage({
       .then(r => r.json())
       .then((d: any) => { if (d.ok) setCalibLimits(d.limits); });
   const handleDiscard     = () => post("/api/episodes/discard");
+  const handleNewEpisode  = () => post("/api/episodes/new");
+  const handleAddTake     = () => post("/api/episodes/add_take");
+  const handleOpenReview  = () => setReviewDismissed(false);
   const handleSpeedChange = (v: number) => {
     setSpeedScale(v);
     post("/api/replay/speed", { speed_scale: v });
@@ -103,9 +106,55 @@ export default function CapturePage({
   const showStream = mode !== "IDLE" && mode !== "CONNECTING";
   const mainUrl    = `${FLASK_HTTP_ORIGIN}/stream/camera/${selectedCam}`;
   const info       = STEP_INFO[mode];
+  const cameraTabs = useMemo(() => {
+    const cams = Object.values(camera.cameras ?? {}).flatMap(c => {
+      if (c.enabled === false) return [];
+      const baseId = c.id ?? c.name ?? "";
+      if (!baseId) return [];
+      const label = c.label ?? c.name ?? c.id ?? "Camera";
+      const streams = c.streams ?? ["color"];
+      const tabs: Array<{ id: string; label: string; info: typeof c; stream: string }> = [];
+      if (streams.includes("color")) tabs.push({ id: baseId, label, info: c, stream: "color" });
+      if (streams.includes("depth")) tabs.push({ id: `${baseId}_depth`, label: `${label} Depth`, info: c, stream: "depth" });
+      return tabs;
+    });
+    if (!cams.length) {
+      return [
+        { id: "cam0", label: "Cam0", info: undefined, stream: "color" },
+        { id: "cam1", label: "Cam1", info: undefined, stream: "color" },
+        { id: "realsense", label: "RealSense", info: undefined, stream: "color" },
+        { id: "realsense_depth", label: "RealSense Depth", info: undefined, stream: "depth" },
+      ];
+    }
+    return cams;
+  }, [camera.cameras]);
+
+  useEffect(() => {
+    if (!cameraTabs.some(c => c.id === selectedCam)) {
+      setSelectedCam(cameraTabs[0]?.id ?? "cam0");
+    }
+  }, [cameraTabs, selectedCam]);
 
   return (
     <div style={styles.root}>
+      {mode === "PROCESSING" && (
+        <ReviewEpisodeModal
+          mode={mode}
+          availableActions={availableActions}
+          episodeId={episodeId}
+          saveSteps={saveSteps}
+        />
+      )}
+      {mode === "REVIEW" && !reviewDismissed && (
+        <ReviewEpisodeModal
+          mode={mode}
+          availableActions={availableActions}
+          episodeId={episodeId}
+          saveSteps={saveSteps}
+          onClose={() => setReviewDismissed(true)}
+        />
+      )}
+
       {/* Saving overlay */}
       {isSaving && (
         <div style={styles.overlay}>
@@ -140,8 +189,8 @@ export default function CapturePage({
 
       {/* ── Camera tab row (below the card) ────────────────────────── */}
       <div style={styles.cameraTabs}>
-        {ALL_CAMERAS.map(c => {
-          const camInfo = camera.cameras?.[c.id];
+        {cameraTabs.map(c => {
+          const camInfo = c.info;
           const isStreaming = camInfo?.streaming ?? false;
           const fps = camInfo?.fps;
           const isActive = selectedCam === c.id;
@@ -162,6 +211,9 @@ export default function CapturePage({
                 display: "inline-block",
               }} />
               {c.label}
+              {c.stream === "depth" && (
+                <span style={{ fontSize: 10, opacity: 0.75 }}>depth</span>
+              )}
               {fps !== undefined && (
                 <span style={{ fontSize: 10, opacity: 0.7 }}>{fps}fps</span>
               )}
@@ -172,6 +224,8 @@ export default function CapturePage({
 
       {/* ── Row B: Step Card ────────────────────────────────────────── */}
       <div style={styles.stepCard}>
+        <EpisodeFlowStepper mode={mode} />
+
         {/* Left: step info + optional extra input */}
         <div style={styles.stepLeft}>
           <span style={styles.stepBadge}>{info.badge}</span>
@@ -291,9 +345,20 @@ export default function CapturePage({
           )}
 
           {(mode === "REVIEW" || mode === "SAVED" || mode === "DISCARDED") && (
-            <div style={{ fontSize: 12, color: "#6b7280", padding: "4px 0" }}>
-              See the Review tab →
-            </div>
+            <>
+              {mode === "REVIEW" && (
+                <Btn label="Open Review" onClick={handleOpenReview} primary disabled={!can("save_episode")} />
+              )}
+              {mode === "SAVED" && (
+                <>
+                  <Btn label="New Episode" onClick={handleNewEpisode} primary disabled={!can("new_episode")} />
+                  <Btn label="Add Another Take" onClick={handleAddTake} disabled={!can("add_take")} />
+                </>
+              )}
+              {mode === "DISCARDED" && (
+                <Btn label="New Episode" onClick={handleNewEpisode} primary disabled={!can("new_episode")} />
+              )}
+            </>
           )}
 
           {/* Advanced panel (freedrive) for relevant states */}
@@ -327,6 +392,42 @@ export default function CapturePage({
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
+
+const FLOW_STEPS: { label: string; modes: AppMode[] }[] = [
+  { label: "Ready Pose", modes: ["IDLE", "CONNECTING", "READY", "CALIBRATING"] },
+  { label: "Teaching", modes: ["TEACH_READY", "TEACH_RECORDING"] },
+  { label: "Return Home", modes: ["TRAJECTORY_CHECK", "RETURN_HOME"] },
+  { label: "Replay & Record", modes: ["REPLAY_READY", "REPLAY_RECORDING", "PROCESSING"] },
+  { label: "Review", modes: ["REVIEW", "SAVED", "DISCARDED"] },
+];
+
+function flowIndex(mode: AppMode): number {
+  const idx = FLOW_STEPS.findIndex(step => step.modes.includes(mode));
+  return idx >= 0 ? idx : 0;
+}
+
+function EpisodeFlowStepper({ mode }: { mode: AppMode }) {
+  const cur = flowIndex(mode);
+  return (
+    <div style={flowStyles.wrap}>
+      <div style={flowStyles.label}>Episode Flow</div>
+      <div style={flowStyles.steps}>
+        {FLOW_STEPS.map((step, idx) => {
+          const status: "done" | "active" | "pending" =
+            idx < cur ? "done" : idx === cur ? "active" : "pending";
+          return (
+            <div key={step.label} style={{ ...flowStyles.step, ...flowStepStyle(status) }}>
+              <span style={flowStyles.dot}>
+                {status === "done" ? "✓" : status === "active" ? "●" : "○"}
+              </span>
+              <span>{step.label}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 /**
  * TeachIndicator — TEACH_RECORDING 상태에서 countdown → "ARM IS FREE" 표시
@@ -588,6 +689,48 @@ function ReplayProgressCircle({ progress }: { progress: number }) {
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
+function flowStepStyle(status: "done" | "active" | "pending"): React.CSSProperties {
+  if (status === "done") return { color: "#15803d", background: "#f0fdf4", borderColor: "#bbf7d0" };
+  if (status === "active") return { color: "#3730a3", background: "#eef2ff", borderColor: "#c7d2fe" };
+  return { color: "#94a3b8", background: "#f8fafc", borderColor: "#e5e7eb" };
+}
+
+const flowStyles: Record<string, React.CSSProperties> = {
+  wrap: {
+    width: "100%",
+    borderBottom: "1px solid #eef2f7",
+    paddingBottom: 10,
+    marginBottom: 2,
+  },
+  label: {
+    fontSize: 10,
+    fontWeight: 800,
+    color: "#94a3b8",
+    letterSpacing: 0.8,
+    textTransform: "uppercase" as const,
+    marginBottom: 6,
+  },
+  steps: {
+    display: "grid",
+    gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
+    gap: 6,
+  },
+  step: {
+    border: "1px solid",
+    borderRadius: 7,
+    padding: "6px 8px",
+    fontSize: 11,
+    fontWeight: 800,
+    display: "flex",
+    alignItems: "center",
+    gap: 5,
+    minWidth: 0,
+    whiteSpace: "nowrap" as const,
+    overflow: "hidden",
+  },
+  dot: { flexShrink: 0, width: 14 },
+};
+
 const styles: Record<string, React.CSSProperties> = {
   root: {
     display: "flex",
@@ -657,6 +800,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     padding: "12px 16px",
     display: "flex",
+    flexWrap: "wrap",
     gap: 16,
     alignItems: "flex-start",
   },

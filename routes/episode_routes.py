@@ -25,6 +25,7 @@ import os
 from typing import Optional
 
 from flask import Blueprint, current_app, jsonify, request, send_file, abort
+from camera_manifest import camera_by_id, overview_camera, video_file_name, camera_csv_name, frames_dir_name
 
 bp = Blueprint("episodes", __name__, url_prefix="/api/episodes")
 
@@ -47,6 +48,49 @@ def _take_dir(episode_id: str, take: Optional[str] = None) -> Optional[str]:
     return mgr.get_latest_take_dir(episode_id)
 
 
+def _video_duration_s(path: str) -> float | None:
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        if fps and fps > 0 and frames and frames > 0:
+            return round(float(frames / fps), 2)
+    except Exception:
+        return None
+    return None
+
+
+def _preview_video_path(take_dir: str) -> str | None:
+    candidates: list[str] = []
+    for cam in [overview_camera(), camera_by_id("cam0"), camera_by_id("realsense")]:
+        if cam:
+            candidates.append(video_file_name(cam, "color"))
+    candidates.append("video.mp4")
+    seen: set[str] = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        path = os.path.join(take_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _take_completeness(take_dir: str, ep_success: bool | None) -> dict:
+    return {
+        "rgb": os.path.exists(os.path.join(take_dir, "video.mp4")),
+        "depth": os.path.exists(os.path.join(take_dir, "video_depth.mp4")),
+        "cam0": os.path.exists(os.path.join(take_dir, "video_webcam_0.mp4")),
+        "cam1": os.path.exists(os.path.join(take_dir, "video_webcam_1.mp4")),
+        "joints": os.path.exists(os.path.join(take_dir, "teach_joint.csv")) and os.path.exists(os.path.join(take_dir, "executed_joint.csv")),
+        "traj": os.path.exists(os.path.join(take_dir, "teach_joint.csv")),
+        "label": ep_success is not None,
+    }
+
+
 @bp.get("")
 def list_episodes():
     from config import DATASET_PATH
@@ -56,10 +100,12 @@ def list_episodes():
         ep_id = ep.get("episode_id", "")
         takes_dir = os.path.join(DATASET_PATH, ep_id, "takes")
         has_pp = False
+        latest_take = None
         if os.path.isdir(takes_dir):
             take_names = sorted(d for d in os.listdir(takes_dir)
                                 if os.path.isdir(os.path.join(takes_dir, d)))
             if take_names:
+                latest_take = take_names[-1]
                 em_path = os.path.join(takes_dir, take_names[-1], "edit_meta.json")
                 if os.path.exists(em_path):
                     try:
@@ -69,6 +115,19 @@ def list_episodes():
                     except (OSError, json.JSONDecodeError):
                         pass
         ep["has_postprocess"] = has_pp
+        if latest_take:
+            td = os.path.join(takes_dir, latest_take)
+            preview_path = _preview_video_path(td)
+            ep["preview_video_url"] = f"/api/episodes/{ep_id}/preview_video" if preview_path else None
+            ep["duration_s"] = _video_duration_s(preview_path) if preview_path else None
+            ep["completeness"] = _take_completeness(td, ep.get("success"))
+        else:
+            ep["preview_video_url"] = None
+            ep["duration_s"] = None
+            ep["completeness"] = {
+                "rgb": False, "depth": False, "cam0": False, "cam1": False,
+                "joints": False, "traj": False, "label": ep.get("success") is not None,
+            }
     return jsonify(episodes)
 
 
@@ -163,6 +222,17 @@ def get_video_depth(episode_id: str):
     return send_file(path, mimetype="video/mp4")
 
 
+@bp.get("/<episode_id>/preview_video")
+def get_preview_video(episode_id: str):
+    td = _take_dir(episode_id)
+    if not td:
+        return abort(404)
+    path = _preview_video_path(td)
+    if not path:
+        return abort(404)
+    return send_file(path, mimetype="video/mp4")
+
+
 @bp.get("/<episode_id>/video_webcam_0")
 def get_video_webcam0(episode_id: str):
     td = _take_dir(episode_id)
@@ -180,6 +250,20 @@ def get_video_webcam1(episode_id: str):
     if not td:
         return abort(404)
     path = os.path.join(td, "video_webcam_1.mp4")
+    if not os.path.exists(path):
+        return abort(404)
+    return send_file(path, mimetype="video/mp4")
+
+
+@bp.get("/<episode_id>/video_camera/<cam_id>")
+def get_video_camera(episode_id: str, cam_id: str):
+    td = _take_dir(episode_id)
+    if not td:
+        return abort(404)
+    cam = camera_by_id(cam_id)
+    if not cam:
+        return abort(404)
+    path = os.path.join(td, video_file_name(cam, "color"))
     if not os.path.exists(path):
         return abort(404)
     return send_file(path, mimetype="video/mp4")
@@ -207,6 +291,17 @@ def get_take_video_depth(episode_id: str, take: str):
     return send_file(path, mimetype="video/mp4")
 
 
+@bp.get("/<episode_id>/takes/<take>/preview_video")
+def get_take_preview_video(episode_id: str, take: str):
+    td = _take_dir(episode_id, take)
+    if not td:
+        return abort(404)
+    path = _preview_video_path(td)
+    if not path:
+        return abort(404)
+    return send_file(path, mimetype="video/mp4")
+
+
 @bp.get("/<episode_id>/takes/<take>/video_webcam_0")
 def get_take_video_webcam0(episode_id: str, take: str):
     td = _take_dir(episode_id, take)
@@ -224,6 +319,20 @@ def get_take_video_webcam1(episode_id: str, take: str):
     if not td:
         return abort(404)
     path = os.path.join(td, "video_webcam_1.mp4")
+    if not os.path.exists(path):
+        return abort(404)
+    return send_file(path, mimetype="video/mp4")
+
+
+@bp.get("/<episode_id>/takes/<take>/video_camera/<cam_id>")
+def get_take_video_camera(episode_id: str, take: str, cam_id: str):
+    td = _take_dir(episode_id, take)
+    if not td:
+        return abort(404)
+    cam = camera_by_id(cam_id)
+    if not cam:
+        return abort(404)
+    path = os.path.join(td, video_file_name(cam, "color"))
     if not os.path.exists(path):
         return abort(404)
     return send_file(path, mimetype="video/mp4")
@@ -330,7 +439,8 @@ def export_lerobot():
 
     with tempfile.TemporaryDirectory() as tmp:
         out_dir = os.path.join(tmp, "lerobot")
-        convert_episodes(episode_ids, DATASET_PATH, out_dir)
+        preset = data.get("preset", data.get("export_preset", "default"))
+        convert_episodes(episode_ids, DATASET_PATH, out_dir, export_preset=preset)
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
@@ -470,12 +580,25 @@ def get_take_frame_webcam1_at(episode_id: str, take: str):
     t_sec = float(request.args.get("t", 0))
     ref = request.args.get("ref", "video")  # "video" | "camera"
 
+    return _send_camera_frame_at(episode_id, take, "cam1", t_sec, ref)
+
+
+@bp.get("/<episode_id>/takes/<take>/frame_camera_at/<cam_id>")
+def get_take_frame_camera_at(episode_id: str, take: str, cam_id: str):
+    t_sec = float(request.args.get("t", 0))
+    ref = request.args.get("ref", "video")
+    return _send_camera_frame_at(episode_id, take, cam_id, t_sec, ref)
+
+
+def _send_camera_frame_at(episode_id: str, take: str, cam_id: str, t_sec: float, ref: str):
+    from config import DATASET_PATH
     td = os.path.join(DATASET_PATH, episode_id, "takes", take)
-    frames_dir = os.path.join(td, "frames_webcam_1")
+    cam = camera_by_id(cam_id) or overview_camera()
+    frames_dir = os.path.join(td, frames_dir_name(cam)) if cam else os.path.join(td, "frames_webcam_1")
     if not os.path.isdir(frames_dir):
         return abort(404)
 
-    cam_csv_path = os.path.join(td, "camera_frames_webcam_1.csv")
+    cam_csv_path = os.path.join(td, camera_csv_name(cam)) if cam else os.path.join(td, "camera_frames_webcam_1.csv")
     frame_idx = 0
     if os.path.exists(cam_csv_path):
         with open(cam_csv_path) as f:
@@ -483,7 +606,7 @@ def get_take_frame_webcam1_at(episode_id: str, take: str):
         if rows:
             if ref == "video":
                 # 비디오 시간을 카메라 프레임 비율로 변환.
-                video_duration = _get_video_duration(os.path.join(td, "video_webcam_1.mp4"))
+                video_duration = _get_video_duration(os.path.join(td, video_file_name(cam, "color"))) if cam else None
                 if video_duration and video_duration > 0:
                     frac = max(0.0, min(1.0, t_sec / video_duration))
                     row_idx = int(round(frac * (len(rows) - 1)))
@@ -513,7 +636,7 @@ def get_edit_meta(episode_id: str, take: str):
     path = os.path.join(td, "edit_meta.json")
     if not os.path.exists(path):
         return jsonify({"trim": {"enabled": False, "cut_t": None, "margin": 1.0},
-                        "mask": {"enabled": False, "polygon": [], "fill": "black"}})
+                        "mask": {"enabled": False, "camera_id": "cam1", "polygon": [], "fill": "black"}})
     with open(path) as f:
         return jsonify(json.load(f))
 

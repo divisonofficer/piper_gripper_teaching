@@ -33,6 +33,13 @@ import numpy as np
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import DATASET_PATH, REALSENSE_FPS
+from camera_manifest import (
+    camera_csv_name,
+    frames_dir_name,
+    legacy_id_for,
+    load_manifest,
+    video_file_name,
+)
 
 DOF = 6
 
@@ -360,12 +367,29 @@ class EpisodeManager:
         )
 
         result = {}
-        jobs = [
-            ("video_color",    "frames",          "color_",  "video.mp4",        "camera_frames_realsense.csv", "camera_frames.csv"),
-            ("video_depth",    "frames",          "depth_",  "video_depth.mp4",  "camera_frames_realsense.csv", "camera_frames.csv"),
-            ("video_webcam_0", "frames_webcam_0", "color_",  "video_webcam_0.mp4", "camera_frames_webcam_0.csv", None),
-            ("video_webcam_1", "frames_webcam_1", "color_",  "video_webcam_1.mp4", "camera_frames_webcam_1.csv", None),
-        ]
+        jobs = []
+        manifest = load_manifest()
+        for cam in manifest.get("cameras", []):
+            if not cam.get("enabled", True):
+                continue
+            legacy = legacy_id_for(cam)
+            fdir = frames_dir_name(cam)
+            csv_name = camera_csv_name(cam)
+            if "color" in cam.get("streams", []):
+                step_key = "video_color" if legacy == "realsense" else f"video_{cam['id']}"
+                fallback_csv = "camera_frames.csv" if legacy == "realsense" else None
+                jobs.append((step_key, fdir, "color_", video_file_name(cam, "color"), csv_name, fallback_csv))
+            if "depth" in cam.get("streams", []):
+                jobs.append(("video_depth", fdir, "depth_", video_file_name(cam, "depth"), csv_name, "camera_frames.csv"))
+
+        # Legacy fallback if cameras.json is missing old webcams.
+        if not jobs:
+            jobs = [
+                ("video_color",    "frames",          "color_",  "video.mp4",        "camera_frames_realsense.csv", "camera_frames.csv"),
+                ("video_depth",    "frames",          "depth_",  "video_depth.mp4",  "camera_frames_realsense.csv", "camera_frames.csv"),
+                ("video_webcam_0", "frames_webcam_0", "color_",  "video_webcam_0.mp4", "camera_frames_webcam_0.csv", None),
+                ("video_webcam_1", "frames_webcam_1", "color_",  "video_webcam_1.mp4", "camera_frames_webcam_1.csv", None),
+            ]
         for step_key, fdir, prefix, out_name, cam_csv_name, fallback_csv_name in jobs:
             _step(step_key, "running")
             r = self._generate_video_concat(
@@ -573,12 +597,9 @@ class EpisodeManager:
     def _build_checklist(self) -> dict:
         if not self.current_take_dir:
             return {}
-        # 멀티카메라: 하나라도 있으면 camera_frames_recorded=True
-        cam_frame_files = [
-            "camera_frames.csv",            # 구버전 단일 카메라
-            "camera_frames_realsense.csv",  # 신버전 멀티카메라
-            "camera_frames_webcam_0.csv",
-            "camera_frames_webcam_1.csv",
+        manifest = load_manifest()
+        cam_frame_files = ["camera_frames.csv"] + [
+            camera_csv_name(cam) for cam in manifest.get("cameras", [])
         ]
         files = {
             "teach_joint.csv": "teach_recorded",
@@ -594,13 +615,12 @@ class EpisodeManager:
         result["camera_frames_recorded"] = any(
             os.path.exists(os.path.join(self.current_take_dir, f)) for f in cam_frame_files
         )
-        # 웹캠별 체크
-        result["webcam_0_recorded"] = os.path.exists(
-            os.path.join(self.current_take_dir, "camera_frames_webcam_0.csv"))
-        result["webcam_1_recorded"] = os.path.exists(
-            os.path.join(self.current_take_dir, "camera_frames_webcam_1.csv"))
-        result["realsense_recorded"] = os.path.exists(
-            os.path.join(self.current_take_dir, "camera_frames_realsense.csv"))
+        for cam in manifest.get("cameras", []):
+            legacy = legacy_id_for(cam)
+            recorded = os.path.exists(os.path.join(self.current_take_dir, camera_csv_name(cam)))
+            result[f"{cam['id']}_recorded"] = recorded
+            if legacy != cam["id"]:
+                result[f"{legacy}_recorded"] = recorded
         result["labeled"] = os.path.exists(os.path.join(self.current_episode_dir, "label.json"))
         return result
 
@@ -648,18 +668,30 @@ class EpisodeManager:
             take_dir = os.path.join(takes_dir, take_name)
             if not os.path.isdir(take_dir):
                 continue
-            has_video     = os.path.exists(os.path.join(take_dir, "video.mp4"))
-            has_teach     = os.path.exists(os.path.join(take_dir, "teach_joint.csv"))
-            has_webcam_0  = os.path.exists(os.path.join(take_dir, "video_webcam_0.mp4"))
-            has_webcam_1  = os.path.exists(os.path.join(take_dir, "video_webcam_1.mp4"))
-            takes.append({
+            has_video = os.path.exists(os.path.join(take_dir, "video.mp4"))
+            has_teach = os.path.exists(os.path.join(take_dir, "teach_joint.csv"))
+            manifest = load_manifest()
+            camera_videos = {}
+            for cam in manifest.get("cameras", []):
+                color_file = video_file_name(cam, "color")
+                if os.path.exists(os.path.join(take_dir, color_file)):
+                    camera_videos[cam["id"]] = {
+                        "id": cam["id"],
+                        "label": cam.get("label", cam["id"]),
+                        "role": cam.get("role", ""),
+                        "legacy_id": legacy_id_for(cam),
+                        "video": color_file,
+                    }
+            take_info = {
                 "take":        take_name,
                 "has_video":   has_video,
                 "has_teach":   has_teach,
-                "has_webcam_0": has_webcam_0,
-                "has_webcam_1": has_webcam_1,
+                "has_webcam_0": os.path.exists(os.path.join(take_dir, "video_webcam_0.mp4")),
+                "has_webcam_1": os.path.exists(os.path.join(take_dir, "video_webcam_1.mp4")),
+                "cameras":      list(camera_videos.values()),
                 "size_mb":     self._dir_size_mb(take_dir),
-            })
+            }
+            takes.append(take_info)
         return takes
 
     def get_episode_meta(self, episode_id: str) -> Optional[dict]:

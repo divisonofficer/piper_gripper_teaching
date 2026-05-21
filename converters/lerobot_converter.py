@@ -13,13 +13,21 @@ import subprocess
 
 import numpy as np
 import pandas as pd
+from camera_manifest import (
+    camera_by_id,
+    camera_csv_name,
+    export_cameras,
+    frames_dir_name,
+    legacy_id_for,
+    load_manifest,
+    overview_camera,
+    video_file_name,
+)
 
 TARGET_FPS = 15
 IMG_SIZE = 224
 CODEBASE_VERSION = "v2.0"
 ROBOT_TYPE = "piper"
-CAM_KEYS = ["observation.images.cam_webcam_0", "observation.images.cam_webcam_1"]
-CAM_FILES = ["video_webcam_0.mp4", "video_webcam_1.mp4"]
 
 # gripper open/closed 판정 임계값 (piper_node.py 와 동일)
 GRIPPER_MID = 0.02219
@@ -65,9 +73,11 @@ def _get_video_duration(video_path: str) -> float | None:
     return None
 
 
-def _get_take_video_duration(take_dir: str) -> float | None:
-    """export 기준 비디오 duration. webcam_1을 우선 사용하고 없으면 webcam_0."""
-    for cam_file in ("video_webcam_1.mp4", "video_webcam_0.mp4", "video.mp4"):
+def _get_take_video_duration(take_dir: str, cameras: list[dict] | None = None) -> float | None:
+    """export 기준 비디오 duration. export camera를 우선 사용."""
+    cam_files = [video_file_name(cam, "color") for cam in cameras or []]
+    cam_files += ["video_webcam_1.mp4", "video_webcam_0.mp4", "video.mp4"]
+    for cam_file in cam_files:
         duration = _get_video_duration(os.path.join(take_dir, cam_file))
         if duration and duration > 0:
             return duration
@@ -140,9 +150,11 @@ def _trim_samples(samples: list[dict], cut_t: float | None) -> list[dict]:
     return [s for s in samples if s["t"] <= cut_t + 1e-6]
 
 
-def _find_webcam1_frame(take_dir: str, t_sec: float, video_duration: float | None = None) -> str | None:
-    """비디오 t_sec에 가장 가까운 webcam_1 원본 프레임 파일 경로 반환."""
-    csv_path = os.path.join(take_dir, "camera_frames_webcam_1.csv")
+def _find_mask_frame(take_dir: str, t_sec: float, video_duration: float | None = None, camera_id: str | None = None) -> str | None:
+    """비디오 t_sec에 가장 가까운 mask target camera 원본 프레임 파일 경로 반환."""
+    cam = camera_by_id(camera_id) if camera_id else overview_camera()
+    cam = cam or overview_camera()
+    csv_path = os.path.join(take_dir, camera_csv_name(cam)) if cam else os.path.join(take_dir, "camera_frames_webcam_1.csv")
     if not os.path.exists(csv_path):
         return None
     with open(csv_path) as f:
@@ -157,7 +169,7 @@ def _find_webcam1_frame(take_dir: str, t_sec: float, video_duration: float | Non
         t_target = t0 + int(t_sec * 1e9)
         best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target))
     frame_idx = int(best["frame_idx"])
-    frames_dir = os.path.join(take_dir, "frames_webcam_1")
+    frames_dir = os.path.join(take_dir, frames_dir_name(cam)) if cam else os.path.join(take_dir, "frames_webcam_1")
     for ext in ("jpg", "png"):
         path = os.path.join(frames_dir, f"color_{frame_idx:06d}.{ext}")
         if os.path.exists(path):
@@ -266,12 +278,25 @@ def _get_latest_take_dir(ep_dir: str) -> str | None:
     return os.path.join(takes_dir, takes[-1])
 
 
-def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) -> None:
+def _cam_feature_key(cam: dict) -> str:
+    return f"observation.images.{cam['id']}"
+
+
+def convert_episodes(
+    episode_ids: list[str],
+    dataset_path: str,
+    out_dir: str,
+    export_preset: str = "default",
+) -> None:
     """
     선택된 episode_ids를 LeRobot v2.0 형식으로 out_dir에 변환 저장.
     각 episode의 마지막 take를 LeRobot 에피소드 1개로 매핑.
     """
     os.makedirs(out_dir, exist_ok=True)
+    manifest = load_manifest()
+    export_cam_list = export_cameras(export_preset, manifest)
+    if not export_cam_list:
+        export_cam_list = export_cameras("default", manifest)
 
     # ── 1. 태스크 목록 수집 ──────────────────────────────────────────────
     task_to_idx: dict[str, int] = {}
@@ -311,7 +336,7 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
 
         # replay 비디오는 executed_joint 실제 시간을 speed-adjust한 결과이므로,
         # parquet trajectory도 executed_joint를 비디오 duration으로 정규화해 생성한다.
-        full_video_duration = _get_take_video_duration(take_dir)
+        full_video_duration = _get_take_video_duration(take_dir, export_cam_list)
         joint_csv = os.path.join(take_dir, "executed_joint.csv")
         if not os.path.exists(joint_csv):
             joint_csv = os.path.join(take_dir, "teach_joint.csv")
@@ -354,7 +379,8 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
             fill = mask_cfg.get("fill", "black")
             if fill == "frame_capture":
                 capture_t = float(mask_cfg.get("capture_t", 0))
-                frame_path = _find_webcam1_frame(take_dir, capture_t, full_video_duration)
+                mask_camera_id = str(mask_cfg.get("camera_id") or "cam1")
+                frame_path = _find_mask_frame(take_dir, capture_t, full_video_duration, mask_camera_id)
                 if frame_path:
                     mask_overlay_path = _make_frame_capture_overlay(mask_cfg["polygon"], frame_path)
             else:  # "black" or default
@@ -385,7 +411,9 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
         df.to_parquet(parquet_path, index=False)
 
         # 비디오 변환 — 트림 + 마스크 적용
-        for cam_key, cam_file in zip(CAM_KEYS, CAM_FILES):
+        for cam in export_cam_list:
+            cam_key = _cam_feature_key(cam)
+            cam_file = video_file_name(cam, "color")
             src = os.path.join(take_dir, cam_file)
             if not os.path.exists(src):
                 continue
@@ -393,8 +421,10 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
                 out_dir, "videos", "chunk-000", cam_key,
                 f"episode_{ep_idx:06d}.mp4",
             )
-            # cam_webcam_1 (두 번째 캠)에만 마스크 적용
-            apply_mask = mask_overlay_path if cam_key == CAM_KEYS[1] else None
+            mask_camera_id = str(mask_cfg.get("camera_id") or "cam1")
+            mask_cam = camera_by_id(mask_camera_id) or overview_camera()
+            mask_target_id = mask_cam.get("id") if mask_cam else "cam1"
+            apply_mask = mask_overlay_path if cam.get("id") == mask_target_id else None
             _encode_video(src, dst, max_duration=video_duration, mask_overlay=apply_mask, ss=0.0)
 
         # 임시 마스크 PNG 정리
@@ -449,8 +479,7 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
         "features": {
             "observation.state": {"dtype": "float32", "shape": [7], "names": joint_names},
             "action":            {"dtype": "float32", "shape": [7], "names": joint_names},
-            CAM_KEYS[0]:         cam_feature,
-            CAM_KEYS[1]:         cam_feature,
+            **{_cam_feature_key(cam): cam_feature for cam in export_cam_list},
         },
         "splits":          {"train": f"0:{total_eps}"},
         "total_episodes":  total_eps,
@@ -460,6 +489,20 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
         "chunks_size":     1000,
         "data_path":       "data/chunk-{chunk_index:03d}/episode_{episode_index:06d}.parquet",
         "video_path":      "videos/chunk-{chunk_index:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "camera_manifest": {
+            "export_preset": export_preset,
+            "exported_cameras": [
+                {
+                    "id": cam["id"],
+                    "role": cam.get("role"),
+                    "label": cam.get("label"),
+                    "legacy_id": legacy_id_for(cam),
+                    "feature_key": _cam_feature_key(cam),
+                }
+                for cam in export_cam_list
+            ],
+            "legacy_feature_note": "Previous exports used observation.images.cam_webcam_0/1; this export uses role ids cam0/cam1.",
+        },
     }
 
     with open(os.path.join(meta_dir, "info.json"), "w") as f:

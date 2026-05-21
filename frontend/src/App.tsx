@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { getSocket } from "./socket";
 import type {
   AppMode, ModeChangePayload, RobotState, CameraState,
@@ -8,12 +8,11 @@ import TopBar from "./components/TopBar";
 import WorkflowNav from "./components/WorkflowNav";
 import StatusPanel from "./components/StatusPanel";
 import CapturePage from "./pages/CapturePage";
-import ReviewPage from "./pages/ReviewPage";
 import DatasetPage from "./pages/DatasetPage";
 import DiagnosticsPage from "./pages/DiagnosticsPage";
 import SetupPage from "./pages/SetupPage";
 
-export type Page = "capture" | "review" | "dataset" | "diagnostics" | "setup";
+export type Page = "capture" | "dataset" | "diagnostics" | "setup";
 
 export default function App() {
   const [mode, setMode] = useState<AppMode>("IDLE");
@@ -34,6 +33,9 @@ export default function App() {
     video_depth:   "뎁스 비디오 인코딩",
     video_webcam_0: "웹캠 0 비디오 인코딩",
     video_webcam_1: "웹캠 1 비디오 인코딩",
+    video_cam0: "cam0 비디오 인코딩",
+    video_cam1: "cam1 비디오 인코딩",
+    video_realsense: "RealSense 비디오 인코딩",
   };
 
   const initSaveSteps = (): SaveStep[] =>
@@ -58,22 +60,27 @@ export default function App() {
       });
       setNextAction(data.next_action);
       setAvailableActions(data.available_actions);
-      // PROCESSING 진입 시 review 페이지로 전환 + 스텝 초기화
       if (data.mode === "PROCESSING") {
-        setPage("review");
         setSaveSteps(initSaveSteps());
-      }
-      if (data.mode === "REVIEW" || data.mode === "SAVED" || data.mode === "DISCARDED") {
-        setPage("review");
       }
     });
 
     s.on("save_progress", (data: SaveProgressPayload) => {
-      setSaveSteps(prev => prev.map(s =>
-        s.key === data.step
-          ? { ...s, status: data.status, detail: data.detail ?? "" }
-          : s
-      ));
+      setSaveSteps(prev => {
+        if (!prev.some(s => s.key === data.step)) {
+          return [...prev, {
+            key: data.step,
+            label: SAVE_STEP_LABELS[data.step] ?? data.step,
+            status: data.status,
+            detail: data.detail ?? "",
+          }];
+        }
+        return prev.map(s =>
+          s.key === data.step
+            ? { ...s, status: data.status, detail: data.detail ?? "" }
+            : s
+        );
+      });
     });
 
     s.on("robot_state", (data: RobotState) => setRobot(data));
@@ -93,25 +100,7 @@ export default function App() {
     };
   }, []);
 
-  const handleGoBack = useCallback(() => {
-    fetch("/api/go_back", { method: "POST" })
-      .then(r => r.json())
-      .then(d => {
-        if (d.ok) setPage("capture");
-      });
-  }, []);
-
   const renderMain = () => {
-    if (page === "review") {
-      return (
-        <ReviewPage
-          mode={mode}
-          availableActions={availableActions}
-          episodeId={logger.episode_id}
-          saveSteps={saveSteps}
-        />
-      );
-    }
     if (page === "dataset") return <DatasetPage />;
     if (page === "diagnostics") return <DiagnosticsPage devMode={devMode} robot={robot} camera={camera} />;
     if (page === "setup") return <SetupPage robot={robot} />;
@@ -122,6 +111,8 @@ export default function App() {
         robot={robot}
         camera={camera}
         events={events}
+        episodeId={logger.episode_id}
+        saveSteps={saveSteps}
       />
     );
   };
@@ -138,15 +129,14 @@ export default function App() {
       />
       <div style={styles.body}>
         <WorkflowNav
-          mode={mode}
           page={page}
           onNavigate={setPage}
-          onGoBack={handleGoBack}
         />
         <main style={styles.main}>
           {renderMain()}
         </main>
         <StatusPanel
+          page={page}
           mode={mode}
           robot={robot}
           camera={camera}

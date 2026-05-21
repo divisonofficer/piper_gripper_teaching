@@ -46,16 +46,20 @@ from routes.capture_routes import bp as capture_bp
 from routes.robot_routes import bp as robot_bp
 from routes.episode_routes import bp as episode_bp
 from routes.mask_routes import bp as mask_bp
+from routes.camera_routes import bp as camera_bp
+from routes.urdf_routes import bp as urdf_bp
 
 app.register_blueprint(capture_bp)
 app.register_blueprint(robot_bp)
 app.register_blueprint(episode_bp)
 app.register_blueprint(mask_bp)
+app.register_blueprint(camera_bp)
+app.register_blueprint(urdf_bp)
 
 # ── MJPEG 카메라 스트리밍 ─────────────────────────────────────────────
 
 def _mjpeg_generator(cam_id: str = "primary"):
-    """cam_id: 'primary' | 'realsense' | 'webcam_0' | 'webcam_1'"""
+    """cam_id: 'primary' | manifest camera id | legacy alias"""
     while True:
         mgr = controller._cameras
         if mgr is None:
@@ -83,9 +87,16 @@ def stream_camera():
 
 @app.get("/stream/camera/<cam_id>")
 def stream_camera_by_id(cam_id: str):
-    """개별 카메라 스트림: realsense | realsense_depth | webcam_0 | webcam_1"""
-    allowed = {"realsense", "realsense_depth", "webcam_0", "webcam_1"}
-    if cam_id not in allowed:
+    """개별 카메라 스트림: manifest camera id 또는 legacy alias."""
+    mgr = controller._cameras
+    manifest = mgr.manifest if mgr else None
+    from camera_manifest import camera_by_id, resolve_camera_id
+    if cam_id.endswith("_depth"):
+        base_id = cam_id[:-6]
+        cam = camera_by_id(base_id, manifest)
+        if not cam or "depth" not in cam.get("streams", []):
+            return Response("Not found", status=404)
+    elif resolve_camera_id(cam_id, manifest) is None:
         return Response("Not found", status=404)
     return Response(
         _mjpeg_generator(cam_id),

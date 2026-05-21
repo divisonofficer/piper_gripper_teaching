@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "cameras": [
+    {
+      "id": "cam0",
+      "label": "Cam0 Ego",
+      "type": "opencv",
+      "role": "ego",
+      "enabled": true,
+      "device": "auto:C270:0",
+      "streams": ["color"],
+      "legacy_id": "webcam_0",
+      "export_presets": ["default", "all", "debug"]
+    },
+    {
+      "id": "cam1",
+      "label": "Cam1 Overview",
+      "type": "opencv",
+      "role": "overview",
+      "enabled": true,
+      "device": "auto:C270:1",
+      "streams": ["color"],
+      "legacy_id": "webcam_1",
+      "export_presets": ["default", "all", "debug"]
+    },
+    {
+      "id": "realsense",
+      "label": "RealSense Depth Sensor",
+      "type": "realsense",
+      "role": "depth_sensor",
+      "enabled": true,
+      "device": "auto",
+      "streams": ["color", "depth"],
+      "legacy_id": "realsense",
+      "export_presets": ["all", "debug"]
+    }
+  ]
+}
