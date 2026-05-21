@@ -1,6 +1,6 @@
 """
 Piper 데이터셋 → LeRobot v2.0 형식 변환기
-- teach_joint.csv → observation.state, action (7-dim: q1-q6, gripper)
+- executed_joint.csv → observation.state, action (7-dim: q1-q6, gripper)
 - webcam_0 / webcam_1 영상 → 224×224 @ 15fps (imageio_ffmpeg 사용)
 - 15fps 그리드에 맞게 joint 데이터 선형 보간
 - 트리밍 규칙: 10초 이후 첫 gripper open 전환 감지 후 +1초에서 끊음
@@ -34,8 +34,58 @@ def _get_ffmpeg():
     return get_ffmpeg_exe()
 
 
-def _resample_joints(csv_path: str, target_fps: int = TARGET_FPS) -> list[dict]:
-    """teach_joint.csv를 읽어 target_fps 그리드로 선형 보간."""
+def _get_csv_duration(csv_path: str) -> float | None:
+    """CSV 첫/마지막 t_host_ns 차이(초) 반환."""
+    if not os.path.exists(csv_path):
+        return None
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    if len(rows) < 2:
+        return None
+    t0 = int(float(rows[0]["t_host_ns"]))
+    t1 = int(float(rows[-1]["t_host_ns"]))
+    duration = (t1 - t0) / 1e9
+    return duration if duration > 0 else None
+
+
+def _get_video_duration(video_path: str) -> float | None:
+    """OpenCV metadata로 mp4 duration(초) 반환."""
+    if not os.path.exists(video_path):
+        return None
+    try:
+        import cv2
+    except ImportError:
+        return None
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if fps and fps > 0 and frames and frames > 0:
+        return float(frames / fps)
+    return None
+
+
+def _get_take_video_duration(take_dir: str) -> float | None:
+    """export 기준 비디오 duration. webcam_1을 우선 사용하고 없으면 webcam_0."""
+    for cam_file in ("video_webcam_1.mp4", "video_webcam_0.mp4", "video.mp4"):
+        duration = _get_video_duration(os.path.join(take_dir, cam_file))
+        if duration and duration > 0:
+            return duration
+    return None
+
+
+def _resample_joints(
+    csv_path: str,
+    target_fps: int = TARGET_FPS,
+    output_duration: float | None = None,
+) -> list[dict]:
+    """
+    joint CSV를 target_fps 그리드로 선형 보간.
+
+    output_duration이 주어지면 원본 joint 시간축 전체를 output_duration 안으로
+    정규화한다. replay 비디오가 executed_joint 실제 시간보다 짧게 speed-adjust된
+    경우, parquet timestamp가 비디오 timestamp와 같은 시간축을 쓰도록 맞춘다.
+    """
     if not os.path.exists(csv_path):
         return []
     with open(csv_path) as f:
@@ -50,11 +100,16 @@ def _resample_joints(csv_path: str, target_fps: int = TARGET_FPS) -> list[dict]:
     )
 
     t_end = t_arr[-1]
-    t_grid = np.arange(0, t_end + 1 / target_fps / 2, 1 / target_fps)
-    t_grid = t_grid[t_grid <= t_end + 1e-6]
+    dst_end = float(output_duration) if output_duration and output_duration > 0 else float(t_end)
+    t_grid = np.arange(0, dst_end + 1 / target_fps / 2, 1 / target_fps)
+    t_grid = t_grid[t_grid <= dst_end + 1e-6]
+    if output_duration and output_duration > 0:
+        src_t_grid = np.clip(t_grid / max(dst_end, 1e-9) * t_end, 0.0, t_end)
+    else:
+        src_t_grid = t_grid
 
     q_grid = np.stack(
-        [np.interp(t_grid, t_arr, q_arr[:, i]) for i in range(7)], axis=1
+        [np.interp(src_t_grid, t_arr, q_arr[:, i]) for i in range(7)], axis=1
     )
     return [{"t": float(t), "q": q.tolist()} for t, q in zip(t_grid, q_grid)]
 
@@ -85,8 +140,8 @@ def _trim_samples(samples: list[dict], cut_t: float | None) -> list[dict]:
     return [s for s in samples if s["t"] <= cut_t + 1e-6]
 
 
-def _find_webcam1_frame(take_dir: str, t_sec: float) -> str | None:
-    """t_sec에 가장 가까운 webcam_1 프레임 파일 경로 반환."""
+def _find_webcam1_frame(take_dir: str, t_sec: float, video_duration: float | None = None) -> str | None:
+    """비디오 t_sec에 가장 가까운 webcam_1 원본 프레임 파일 경로 반환."""
     csv_path = os.path.join(take_dir, "camera_frames_webcam_1.csv")
     if not os.path.exists(csv_path):
         return None
@@ -94,9 +149,13 @@ def _find_webcam1_frame(take_dir: str, t_sec: float) -> str | None:
         rows = list(csv.DictReader(f))
     if not rows:
         return None
-    t0 = int(float(rows[0]["t_host_ns"]))
-    t_target = t0 + int(t_sec * 1e9)
-    best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target))
+    if video_duration and video_duration > 0:
+        row_idx = int(round(np.clip(t_sec / video_duration, 0.0, 1.0) * (len(rows) - 1)))
+        best = rows[row_idx]
+    else:
+        t0 = int(float(rows[0]["t_host_ns"]))
+        t_target = t0 + int(t_sec * 1e9)
+        best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target))
     frame_idx = int(best["frame_idx"])
     frames_dir = os.path.join(take_dir, "frames_webcam_1")
     for ext in ("jpg", "png"):
@@ -163,14 +222,19 @@ def _encode_video(
     size: int = IMG_SIZE,
     max_duration: float | None = None,
     mask_overlay: str | None = None,
+    ss: float = 0.0,
 ):
     """imageio_ffmpeg bundled binary で src → size×size @ target_fps h264 mp4.
-    max_duration이 주어지면 그 길이(초)까지만 인코딩.
+    ss: 소스 비디오 시작 오프셋(초) — joint t0와 camera t0 차이 보정에 사용.
+    max_duration이 주어지면 ss 이후 그 길이(초)까지만 인코딩.
     mask_overlay가 주어지면 해당 PNG를 오버레이(mask-out 영역 검정 처리).
     """
     ffmpeg = _get_ffmpeg()
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    cmd = [ffmpeg, "-y", "-i", src_path]
+    cmd = [ffmpeg, "-y"]
+    if ss > 0.01:
+        cmd += ["-ss", f"{ss:.3f}"]
+    cmd += ["-i", src_path]
     if mask_overlay:
         cmd += ["-i", mask_overlay]
     if max_duration is not None:
@@ -245,8 +309,14 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
         if take_dir is None:
             continue
 
-        # Joint 데이터 보간
-        raw_samples = _resample_joints(os.path.join(take_dir, "teach_joint.csv"))
+        # replay 비디오는 executed_joint 실제 시간을 speed-adjust한 결과이므로,
+        # parquet trajectory도 executed_joint를 비디오 duration으로 정규화해 생성한다.
+        full_video_duration = _get_take_video_duration(take_dir)
+        joint_csv = os.path.join(take_dir, "executed_joint.csv")
+        if not os.path.exists(joint_csv):
+            joint_csv = os.path.join(take_dir, "teach_joint.csv")
+
+        raw_samples = _resample_joints(joint_csv, output_duration=full_video_duration)
         if not raw_samples:
             continue
 
@@ -268,6 +338,8 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
                 base_t = _find_trim_gripper_open_t(raw_samples) or raw_samples[-1]["t"]
             margin = float(trim_cfg.get("margin", 1.0))
             video_duration: float | None = base_t + margin
+            if full_video_duration is not None:
+                video_duration = min(video_duration, full_video_duration)
         else:
             # 기본 자동 트리밍 (converter 상수 기반)
             auto_cut = _find_trim_time(raw_samples)
@@ -282,7 +354,7 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
             fill = mask_cfg.get("fill", "black")
             if fill == "frame_capture":
                 capture_t = float(mask_cfg.get("capture_t", 0))
-                frame_path = _find_webcam1_frame(take_dir, capture_t)
+                frame_path = _find_webcam1_frame(take_dir, capture_t, full_video_duration)
                 if frame_path:
                     mask_overlay_path = _make_frame_capture_overlay(mask_cfg["polygon"], frame_path)
             else:  # "black" or default
@@ -323,7 +395,7 @@ def convert_episodes(episode_ids: list[str], dataset_path: str, out_dir: str) ->
             )
             # cam_webcam_1 (두 번째 캠)에만 마스크 적용
             apply_mask = mask_overlay_path if cam_key == CAM_KEYS[1] else None
-            _encode_video(src, dst, max_duration=video_duration, mask_overlay=apply_mask)
+            _encode_video(src, dst, max_duration=video_duration, mask_overlay=apply_mask, ss=0.0)
 
         # 임시 마스크 PNG 정리
         if mask_overlay_path and os.path.exists(mask_overlay_path):

@@ -424,16 +424,51 @@ Kinematics: DH parameters (dh_is_offset=0x01)
 """
 
 
+def _get_teach_duration(take_dir: str) -> float | None:
+    """teach_joint.csv의 첫/마지막 t_host_ns 차이(초) 반환."""
+    path = os.path.join(take_dir, "teach_joint.csv")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        rows = list(csv_module.DictReader(f))
+    if len(rows) < 2:
+        return None
+    t0 = int(float(rows[0]["t_host_ns"]))
+    t1 = int(float(rows[-1]["t_host_ns"]))
+    dur = (t1 - t0) / 1e9
+    return dur if dur > 0 else None
+
+
+def _get_video_duration(video_path: str) -> float | None:
+    """OpenCV metadata로 mp4 duration(초) 반환."""
+    if not os.path.exists(video_path):
+        return None
+    try:
+        import cv2
+    except ImportError:
+        return None
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if fps and fps > 0 and frames and frames > 0:
+        return float(frames / fps)
+    return None
+
+
 @bp.get("/<episode_id>/takes/<take>/frame_webcam1_at")
 def get_take_frame_webcam1_at(episode_id: str, take: str):
     """
     t_sec에 가장 가까운 webcam_1 프레임 반환.
-    ref=joint (기본): teach_joint.csv 기준 시각 → trim/joint 시스템과 동일한 좌표계
-    ref=camera      : camera_frames_webcam_1.csv 의 첫 프레임 기준 시각 (비디오 플레이어 시각)
+
+    ref=video (기본): t_sec는 비디오 플레이어 시각.
+        video duration으로 정규화한 비율로 카메라 프레임을 찾음.
+        replay 비디오가 speed-adjust되어 있어도 올바른 프레임을 반환.
+    ref=camera: 카메라 실시간 절대 시각 기준 (직접 timestamp 매핑).
     """
     from config import DATASET_PATH
     t_sec = float(request.args.get("t", 0))
-    ref = request.args.get("ref", "joint")  # "joint" | "camera"
+    ref = request.args.get("ref", "video")  # "video" | "camera"
 
     td = os.path.join(DATASET_PATH, episode_id, "takes", take)
     frames_dir = os.path.join(td, "frames_webcam_1")
@@ -446,22 +481,21 @@ def get_take_frame_webcam1_at(episode_id: str, take: str):
         with open(cam_csv_path) as f:
             rows = list(csv_module.DictReader(f))
         if rows:
-            cam_t0_ns = int(float(rows[0]["t_host_ns"]))
-            if ref == "joint":
-                # teach_joint.csv 첫 샘플의 절대 시각을 기준으로 삼음
-                joint_csv = os.path.join(td, "teach_joint.csv")
-                t0_ns = cam_t0_ns  # fallback: camera t0
-                if os.path.exists(joint_csv):
-                    with open(joint_csv) as jf:
-                        first_joint = next(csv_module.DictReader(jf), None)
-                    if first_joint:
-                        t0_ns = int(float(first_joint["t_host_ns"]))
+            if ref == "video":
+                # 비디오 시간을 카메라 프레임 비율로 변환.
+                video_duration = _get_video_duration(os.path.join(td, "video_webcam_1.mp4"))
+                if video_duration and video_duration > 0:
+                    frac = max(0.0, min(1.0, t_sec / video_duration))
+                    row_idx = int(round(frac * (len(rows) - 1)))
+                else:
+                    row_idx = 0
+                frame_idx = int(rows[row_idx]["frame_idx"])
             else:
-                t0_ns = cam_t0_ns  # camera-relative
-
-            t_target_ns = t0_ns + int(t_sec * 1e9)
-            best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target_ns))
-            frame_idx = int(best["frame_idx"])
+                # ref == "camera": 카메라 실시간 절대 시각 기준
+                cam_t0_ns = int(float(rows[0]["t_host_ns"]))
+                t_target_ns = cam_t0_ns + int(t_sec * 1e9)
+                best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target_ns))
+                frame_idx = int(best["frame_idx"])
 
     for ext in ("jpg", "png"):
         path = os.path.join(frames_dir, f"color_{frame_idx:06d}.{ext}")

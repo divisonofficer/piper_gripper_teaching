@@ -307,6 +307,7 @@ export default function DatasetPage() {
   const [trajectoryData, setTrajectoryData] = useState<TakeTrajectoryData | null>(null);
   const [trajLoading, setTrajLoading] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [filter, setFilter] = useState<"all" | "success" | "failure" | "unlabeled">("all");
   const [search, setSearch] = useState("");
@@ -812,6 +813,7 @@ export default function DatasetPage() {
                     </div>
                     {videoUrl ? (
                       <video key={videoUrl} ref={videoRef} controls
+                        onLoadedMetadata={() => setVideoDuration(videoRef.current?.duration)}
                         onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
                         style={{ width: "100%", borderRadius: 6, background: "#000", display: "block" }}>
                         <source src={videoUrl} type="video/mp4" />
@@ -866,7 +868,7 @@ export default function DatasetPage() {
                 episodeId={selectedId!}
                 take={selectedTake!}
                 currentTime={currentTime}
-                duration={duration}
+                duration={videoDuration}
                 onSave={meta => {
                   saveEditMeta(meta);
                   // update has_postprocess flag locally
@@ -969,10 +971,12 @@ function EditPanel({
 
       {open && (
         <div style={{ padding: "12px 14px", background: "#fff" }}>
+          {/* ── Trim / Mask 가로 grid ── */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, alignItems: "start", marginBottom: 12 }}>
           {/* ── Trim Editor ── */}
-          <div style={{ marginBottom: 16 }}>
+          <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase" as const, letterSpacing: 0.7, marginBottom: 8 }}>
-              1. Trim (그리퍼 열림 지점 기준 자르기)
+              Trim (그리퍼 열림 기준 자르기)
             </div>
 
             {/* 감지 정보 */}
@@ -1054,7 +1058,7 @@ function EditPanel({
                     <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>
                       컷 지점 프레임 (joint t={trimEnd.toFixed(2)}s):
                     </div>
-                    <Webcam1Frame episodeId={episodeId} take={take} tSec={trimEnd} ref="joint" />
+                    <Webcam1Frame episodeId={episodeId} take={take} tSec={trimEnd} tBase="video" />
                   </div>
                 )}
               </>
@@ -1062,9 +1066,9 @@ function EditPanel({
           </div>
 
           {/* ── Mask Editor ── */}
-          <div style={{ marginBottom: 12 }}>
+          <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase" as const, letterSpacing: 0.7, marginBottom: 8 }}>
-              2. Mask (cam_webcam_1 keep 영역)
+              Mask (cam_webcam_1 keep 영역)
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 8, cursor: "pointer" }}>
@@ -1083,6 +1087,7 @@ function EditPanel({
               />
             )}
           </div>
+          </div>{/* end grid */}
 
           {/* 저장 버튼 */}
           <button
@@ -1103,13 +1108,15 @@ function EditPanel({
 // ── Shared webcam_1 frame preview ────────────────────────────────────────
 
 function Webcam1Frame({
-  episodeId, take, tSec, tBase = "camera", style,
-}: { episodeId: string; take: string; tSec: number; tBase?: "joint" | "camera"; style?: React.CSSProperties }) {
+  episodeId, take, tSec, tBase = "video", style,
+}: { episodeId: string; take: string; tSec: number; tBase?: "video" | "camera"; style?: React.CSSProperties }) {
   const [url, setUrl] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   React.useEffect(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
+    setLoading(true);  // tSec 변경 즉시 dim → 로딩 중 피드백
     timerRef.current = setTimeout(() => {
       setUrl(`/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${tSec.toFixed(2)}&ref=${tBase}&_=${Date.now()}`);
     }, 200);
@@ -1119,7 +1126,10 @@ function Webcam1Frame({
   if (!url) return null;
   return (
     <img src={url} alt={`webcam_1 @${tSec.toFixed(1)}s`}
-      style={{ width: "100%", borderRadius: 5, display: "block", background: "#000", ...style }} />
+      onLoad={() => setLoading(false)}
+      onError={() => setLoading(false)}
+      style={{ width: "100%", borderRadius: 5, display: "block", background: "#000",
+               opacity: loading ? 0.35 : 1, transition: "opacity 0.15s", ...style }} />
   );
 }
 
@@ -1160,7 +1170,7 @@ function MaskPolygonEditor({
   // 프레임 캡쳐 마스크: 캡쳐 기준 프레임 URL
   const captureFrameUrl = React.useMemo(() => {
     if (mask.fill !== "frame_capture" || mask.capture_t === undefined) return "";
-    return `/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${mask.capture_t.toFixed(2)}`;
+    return `/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${mask.capture_t.toFixed(2)}&ref=video`;
   }, [episodeId, take, mask.fill, mask.capture_t]);
 
   const deleteFromLibrary = (id: string) => {
