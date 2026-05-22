@@ -6,6 +6,10 @@ export interface CameraTab {
   avail: boolean;
   maskable: boolean;
   maskCameraId?: string;
+  url?: string;
+  cameraId?: string;
+  stream?: string;
+  role?: string;
 }
 
 interface VideoPaneProps {

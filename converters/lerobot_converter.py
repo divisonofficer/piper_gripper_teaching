@@ -16,6 +16,7 @@ import pandas as pd
 from camera_manifest import (
     camera_by_id,
     camera_csv_name,
+    default_mask_camera_id,
     export_cameras,
     frames_dir_name,
     legacy_id_for,
@@ -154,7 +155,9 @@ def _find_mask_frame(take_dir: str, t_sec: float, video_duration: float | None =
     """비디오 t_sec에 가장 가까운 mask target camera 원본 프레임 파일 경로 반환."""
     cam = camera_by_id(camera_id) if camera_id else overview_camera()
     cam = cam or overview_camera()
-    csv_path = os.path.join(take_dir, camera_csv_name(cam)) if cam else os.path.join(take_dir, "camera_frames_webcam_1.csv")
+    if not cam:
+        return None
+    csv_path = os.path.join(take_dir, camera_csv_name(cam))
     if not os.path.exists(csv_path):
         return None
     with open(csv_path) as f:
@@ -169,7 +172,7 @@ def _find_mask_frame(take_dir: str, t_sec: float, video_duration: float | None =
         t_target = t0 + int(t_sec * 1e9)
         best = min(rows, key=lambda r: abs(int(float(r["t_host_ns"])) - t_target))
     frame_idx = int(best["frame_idx"])
-    frames_dir = os.path.join(take_dir, frames_dir_name(cam)) if cam else os.path.join(take_dir, "frames_webcam_1")
+    frames_dir = os.path.join(take_dir, frames_dir_name(cam))
     for ext in ("jpg", "png"):
         path = os.path.join(frames_dir, f"color_{frame_idx:06d}.{ext}")
         if os.path.exists(path):
@@ -177,10 +180,25 @@ def _find_mask_frame(take_dir: str, t_sec: float, video_duration: float | None =
     return None
 
 
-def _make_mask_overlay(polygon_norm: list, size: int = IMG_SIZE) -> str | None:
+def _parse_hex_color(value: str | None, default: tuple[int, int, int] = (0, 0, 0)) -> tuple[int, int, int]:
+    """Parse #RRGGBB. Export profiles may override the neutral default."""
+    if not value:
+        return default
+    s = value.strip()
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) != 6:
+        return default
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        return default
+
+
+def _make_mask_overlay(polygon_norm: list, size: int = IMG_SIZE, fill_color: str | None = None) -> str | None:
     """
     polygon_norm: [[x_norm, y_norm], ...] normalized 0-1 좌표 (keep 영역)
-    keep 영역 안은 투명, 밖은 검정 불투명인 PNG 파일 경로를 반환.
+    keep 영역 안은 투명, 밖은 fill_color 불투명인 PNG 파일 경로를 반환.
     polygon이 비어있으면 None 반환.
     """
     if not polygon_norm or len(polygon_norm) < 3:
@@ -190,8 +208,8 @@ def _make_mask_overlay(polygon_norm: list, size: int = IMG_SIZE) -> str | None:
     except ImportError:
         return None
     import tempfile
-    # 검정 불투명 (mask-out) 배경
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    r, g, b = _parse_hex_color(fill_color)
+    img = Image.new("RGBA", (size, size), (r, g, b, 255))
     draw = ImageDraw.Draw(img)
     # keep 영역만 투명으로
     pts = [(int(x * size), int(y * size)) for x, y in polygon_norm]
@@ -287,6 +305,8 @@ def convert_episodes(
     dataset_path: str,
     out_dir: str,
     export_preset: str = "default",
+    mask_mode: str = "edit",
+    mask_fill_color: str = "#000000",
 ) -> None:
     """
     선택된 episode_ids를 LeRobot v2.0 형식으로 out_dir에 변환 저장.
@@ -328,11 +348,14 @@ def convert_episodes(
     data_dir = os.path.join(out_dir, "data", "chunk-000")
     os.makedirs(data_dir, exist_ok=True)
 
+    source_map: list[dict] = []
+
     for ep_idx, (ep_id, task) in enumerate(zip(episode_ids, ep_tasks)):
         ep_dir = os.path.join(dataset_path, ep_id)
         take_dir = _get_latest_take_dir(ep_dir)
         if take_dir is None:
             continue
+        take_name = os.path.basename(take_dir)
 
         # replay 비디오는 executed_joint 실제 시간을 speed-adjust한 결과이므로,
         # parquet trajectory도 executed_joint를 비디오 duration으로 정규화해 생성한다.
@@ -374,17 +397,19 @@ def convert_episodes(
 
         # ── 마스크 ────────────────────────────────────────────────────────
         mask_cfg = edit_meta.get("mask", {})
+        fallback_mask_camera_id = default_mask_camera_id(manifest)
         mask_overlay_path: str | None = None
-        if mask_cfg.get("enabled") and mask_cfg.get("polygon"):
+        mask_enabled = mask_mode != "off" and bool(mask_cfg.get("enabled") and mask_cfg.get("polygon"))
+        if mask_enabled:
             fill = mask_cfg.get("fill", "black")
             if fill == "frame_capture":
                 capture_t = float(mask_cfg.get("capture_t", 0))
-                mask_camera_id = str(mask_cfg.get("camera_id") or "cam1")
+                mask_camera_id = str(mask_cfg.get("camera_id") or fallback_mask_camera_id or "")
                 frame_path = _find_mask_frame(take_dir, capture_t, full_video_duration, mask_camera_id)
                 if frame_path:
                     mask_overlay_path = _make_frame_capture_overlay(mask_cfg["polygon"], frame_path)
             else:  # "black" or default
-                mask_overlay_path = _make_mask_overlay(mask_cfg["polygon"])
+                mask_overlay_path = _make_mask_overlay(mask_cfg["polygon"], fill_color=mask_fill_color)
 
         n_frames = len(samples)
         task_idx = task_to_idx[task]
@@ -421,9 +446,9 @@ def convert_episodes(
                 out_dir, "videos", "chunk-000", cam_key,
                 f"episode_{ep_idx:06d}.mp4",
             )
-            mask_camera_id = str(mask_cfg.get("camera_id") or "cam1")
+            mask_camera_id = str(mask_cfg.get("camera_id") or fallback_mask_camera_id or "")
             mask_cam = camera_by_id(mask_camera_id) or overview_camera()
-            mask_target_id = mask_cam.get("id") if mask_cam else "cam1"
+            mask_target_id = mask_cam.get("id") if mask_cam else None
             apply_mask = mask_overlay_path if cam.get("id") == mask_target_id else None
             _encode_video(src, dst, max_duration=video_duration, mask_overlay=apply_mask, ss=0.0)
 
@@ -435,7 +460,37 @@ def convert_episodes(
             "episode_index": ep_idx,
             "tasks":         [task],
             "length":        n_frames,
+            "source_episode_id": ep_id,
+            "source_take": take_name,
+            "task": task,
+            "task_index": task_idx,
+            "source_order": ep_idx,
         })
+        source_entry = {
+            "episode_index": ep_idx,
+            "lerobot_episode_file": f"episode_{ep_idx:06d}",
+            "source_episode_id": ep_id,
+            "source_take": take_name,
+            "task": task,
+            "task_index": task_idx,
+            "length": n_frames,
+            "video_duration_s": video_duration,
+            "full_video_duration_s": full_video_duration,
+            "trim": {
+                "enabled": bool(trim_cfg.get("enabled")),
+                "cut_t": trim_cfg.get("cut_t"),
+                "margin": trim_cfg.get("margin"),
+                "applied_duration_s": video_duration,
+            },
+            "mask": {
+                "mode": mask_mode,
+                "enabled": mask_enabled,
+                "camera_id": str(mask_cfg.get("camera_id") or fallback_mask_camera_id or ""),
+                "fill": mask_cfg.get("fill", "black"),
+                "fill_color": mask_fill_color if mask_enabled and mask_cfg.get("fill", "black") != "frame_capture" else None,
+            },
+        }
+        source_map.append(source_entry)
         global_frame_idx += n_frames
 
     # ── 3. 통계 계산 ─────────────────────────────────────────────────────
@@ -503,6 +558,10 @@ def convert_episodes(
             ],
             "legacy_feature_note": "Previous exports used observation.images.cam_webcam_0/1; this export uses role ids cam0/cam1.",
         },
+        "export_options": {
+            "mask_mode": mask_mode,
+            "mask_fill_color": mask_fill_color,
+        },
     }
 
     with open(os.path.join(meta_dir, "info.json"), "w") as f:
@@ -518,3 +577,44 @@ def convert_episodes(
     with open(os.path.join(meta_dir, "episodes.jsonl"), "w") as f:
         for ep_meta in episodes_meta:
             f.write(json.dumps(ep_meta) + "\n")
+
+    with open(os.path.join(meta_dir, "source_episodes.jsonl"), "w") as f:
+        for row in source_map:
+            f.write(json.dumps(row) + "\n")
+
+    with open(os.path.join(meta_dir, "source_episodes.csv"), "w", newline="") as f:
+        fieldnames = [
+            "episode_index",
+            "lerobot_episode_file",
+            "source_episode_id",
+            "source_take",
+            "task",
+            "task_index",
+            "length",
+            "video_duration_s",
+            "full_video_duration_s",
+            "mask.mode",
+            "mask.enabled",
+            "mask.camera_id",
+            "mask.fill",
+            "mask.fill_color",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in source_map:
+            writer.writerow({
+                "episode_index": row["episode_index"],
+                "lerobot_episode_file": row["lerobot_episode_file"],
+                "source_episode_id": row["source_episode_id"],
+                "source_take": row["source_take"],
+                "task": row["task"],
+                "task_index": row["task_index"],
+                "length": row["length"],
+                "video_duration_s": row["video_duration_s"],
+                "full_video_duration_s": row["full_video_duration_s"],
+                "mask.mode": row["mask"]["mode"],
+                "mask.enabled": row["mask"]["enabled"],
+                "mask.camera_id": row["mask"]["camera_id"],
+                "mask.fill": row["mask"]["fill"],
+                "mask.fill_color": row["mask"]["fill_color"],
+            })

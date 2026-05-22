@@ -877,9 +877,9 @@ class Controller:
 
     def shutdown(self):
         self._poll_stop.set()
-        if self._realsense:
+        if self._cameras:
             try:
-                self._realsense.stop_stream()
+                self._cameras.disconnect()
             except Exception:
                 pass
         if self._ros_executor:

@@ -16,7 +16,7 @@ export default function ReviewEpisodeModal({
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
   const [videoTab, setVideoTab] = useState("color");
-  const [cameraVideos, setCameraVideos] = useState<Array<{ id: string; label: string }>>([]);
+  const [cameraVideos, setCameraVideos] = useState<Array<{ id: string; label: string; url: string }>>([]);
 
   const can = (a: string) => availableActions.includes(a);
 
@@ -30,15 +30,39 @@ export default function ReviewEpisodeModal({
     fetch(`/api/episodes/${episodeId}`)
       .then(r => r.json())
       .then(ep => {
-        const takes: Array<{ has_webcam_0?: boolean; has_webcam_1?: boolean; cameras?: Array<{ id: string; label: string }> }> = ep.takes ?? [];
+        const takes: Array<{
+          take: string;
+          has_video?: boolean;
+          has_webcam_0?: boolean;
+          has_webcam_1?: boolean;
+          cameras?: Array<{
+            id: string;
+            label: string;
+            streams?: Array<{ kind: string; label: string; url: string }>;
+          }>;
+        }> = ep.takes ?? [];
         if (takes.length > 0) {
           const latest = takes[takes.length - 1];
           if (latest.cameras?.length) {
-            setCameraVideos(latest.cameras.map(c => ({ id: c.id, label: c.label || c.id })));
+            const tabs = latest.cameras.flatMap(c => {
+              const streams = c.streams?.length
+                ? c.streams
+                : [{ kind: "color", label: "Color", url: `/api/episodes/${episodeId}/video_camera/${c.id}/color` }];
+              const multi = streams.length > 1;
+              return streams.map(s => ({
+                id: `${c.id}:${s.kind}`,
+                label: multi ? `${c.label || c.id} ${s.label || s.kind}` : c.label || c.id,
+                url: s.url,
+              }));
+            });
+            setCameraVideos(tabs);
+            setVideoTab(tabs[0]?.id ?? "color");
           } else {
             setCameraVideos([
-              ...(latest.has_webcam_0 ? [{ id: "cam0", label: "Cam0" }] : []),
-              ...(latest.has_webcam_1 ? [{ id: "cam1", label: "Cam1" }] : []),
+              ...(latest.has_video ? [{ id: "color", label: "RGB", url: `/api/episodes/${episodeId}/video` }] : []),
+              ...(latest.has_video ? [{ id: "depth", label: "Depth", url: `/api/episodes/${episodeId}/video_depth` }] : []),
+              ...(latest.has_webcam_0 ? [{ id: "cam0", label: "Cam0", url: `/api/episodes/${episodeId}/video_camera/cam0/color` }] : []),
+              ...(latest.has_webcam_1 ? [{ id: "cam1", label: "Cam1", url: `/api/episodes/${episodeId}/video_camera/cam1/color` }] : []),
             ]);
           }
         }
@@ -65,19 +89,8 @@ export default function ReviewEpisodeModal({
     onClose?.();
   };
 
-  const videoTabs: Array<{ id: string; label: string }> = [
-    { id: "color", label: "Color" },
-    { id: "depth", label: "Depth" },
-    ...cameraVideos,
-  ];
-
-  const videoUrl = episodeId
-    ? videoTab === "color"
-      ? `/api/episodes/${episodeId}/video`
-      : videoTab === "depth"
-        ? `/api/episodes/${episodeId}/video_depth`
-        : `/api/episodes/${episodeId}/video_camera/${videoTab}`
-    : null;
+  const videoTabs = cameraVideos;
+  const videoUrl = videoTabs.find(t => t.id === videoTab)?.url ?? null;
 
   if (mode === "PROCESSING") {
     return (

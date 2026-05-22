@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import type { Episode, EpisodeTake, JointSample, TakeJointsData, EditMeta, MaskMeta, MaskLibraryEntry, EESample, TakeTrajectoryData } from "../types";
 import PiperRobotViewer from "../components/PiperRobotViewer";
-import { CompletenessChips, EpisodeCollectionItem, StatusBadge } from "./dataset/DatasetCollection";
+import { CompletenessChips, EpisodeCollectionItem, ReviewIssueBadges, StatusBadge } from "./dataset/DatasetCollection";
 import ExportModal from "./dataset/ExportModal";
 import { BatchInspector, EmptyInspector, SummaryItem } from "./dataset/InspectorSummary";
 import VideoPane, { type CameraTab } from "./dataset/VideoPane";
@@ -331,13 +331,17 @@ export default function DatasetPage() {
   const [exporting, setExporting] = useState(false);
   const [exportingLerobot, setExportingLerobot] = useState(false);
   const [lerobotPreset, setLerobotPreset] = useState<"default" | "all" | "debug">("default");
+  const [lerobotMaskMode, setLerobotMaskMode] = useState<"edit" | "off">("edit");
+  const [maskFillColor, setMaskFillColor] = useState("#000000");
+  const [exportSuccessOnly, setExportSuccessOnly] = useState(false);
+  const [exportIssuePolicy, setExportIssuePolicy] = useState<"include_all" | "exclude_open">("include_all");
   const [bulkTask, setBulkTask] = useState("");
   const [bulkTaskSaving, setBulkTaskSaving] = useState(false);
   const [editMeta, setEditMeta] = useState<EditMeta | null>(null);
   const [sortBy, setSortBy] = useState<"date" | "task" | "size" | "duration" | "status">("date");
   const [viewMode, setViewMode] = useState<ViewMode>("thumbnail");
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("preview");
-  const [postprocessMaskCameraId, setPostprocessMaskCameraId] = useState<string>("cam1");
+  const [postprocessMaskCameraId, setPostprocessMaskCameraId] = useState<string>("");
   const [hoveredEp, setHoveredEp] = useState<string | null>(null);
   const [focusedEp, setFocusedEp] = useState<string | null>(null);
   const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null);
@@ -563,7 +567,14 @@ export default function DatasetPage() {
     fetch("/api/episodes/export_lerobot", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ episode_ids: [...selectedEps], preset: lerobotPreset }),
+      body: JSON.stringify({
+        episode_ids: [...selectedEps],
+        preset: lerobotPreset,
+        mask_mode: lerobotMaskMode,
+        mask_fill_color: maskFillColor,
+        success_only: exportSuccessOnly,
+        issue_policy: exportIssuePolicy,
+      }),
     })
       .then(r => {
         if (!r.ok) throw new Error("export_lerobot failed");
@@ -579,7 +590,7 @@ export default function DatasetPage() {
       })
       .catch(() => {})
       .finally(() => setExportingLerobot(false));
-  }, [selectedEps, exportingLerobot, lerobotPreset]);
+  }, [selectedEps, exportingLerobot, lerobotPreset, lerobotMaskMode, maskFillColor, exportSuccessOnly, exportIssuePolicy]);
 
   const applyBulkTask = useCallback(() => {
     if (!selectedEps.size || bulkTaskSaving) return;
@@ -641,34 +652,37 @@ export default function DatasetPage() {
   const currentTake: EpisodeTake | null = selected?.takes.find(t => t.take === selectedTake) ?? null;
   const cameraTabs = useMemo<CameraTab[]>(() => {
     if (!currentTake) return [];
-    const hasRealSenseBaseStreams = !!currentTake.has_video;
-    const manifestTabs = currentTake.cameras?.length
-      ? currentTake.cameras
-          // RealSense is represented by the dedicated RGB/Depth stream tabs below.
-          // Keeping the manifest camera too would show RGB twice.
-          .filter(c => !(hasRealSenseBaseStreams && c.id === "realsense"))
-          .map(c => ({
-            id: c.id,
-            label: c.label || c.id,
-            avail: true,
-            maskable: true,
-            maskCameraId: c.id,
-          }))
-      : [
-          { id: "webcam_0", label: "Cam0 Ego", avail: !!currentTake.has_webcam_0, maskable: true, maskCameraId: "cam0" },
-          { id: "webcam_1", label: "Cam1 Overview", avail: !!currentTake.has_webcam_1, maskable: true, maskCameraId: "cam1" },
-        ];
+    const streamTabs = (currentTake.cameras ?? []).flatMap(camera => {
+      const streams = camera.streams?.length
+        ? camera.streams
+        : [{ id: "color", label: "Color", kind: "color", video: camera.video, url: `/api/episodes/${selectedId}/takes/${selectedTake}/video_camera/${camera.id}/color`, maskable: true }];
+      const hasMultipleStreams = streams.length > 1;
+      return streams.map(stream => ({
+        id: `${camera.id}:${stream.kind}`,
+        label: hasMultipleStreams ? `${camera.label || camera.id} ${stream.label || stream.kind}` : camera.label || camera.id,
+        avail: true,
+        maskable: !!stream.maskable,
+        maskCameraId: stream.maskable ? camera.id : undefined,
+        url: stream.url,
+        cameraId: camera.id,
+        stream: stream.kind,
+        role: camera.role,
+      }));
+    });
+    if (streamTabs.length) return streamTabs;
     return [
-      { id: "color", label: "RealSense RGB", avail: hasRealSenseBaseStreams, maskable: true, maskCameraId: "realsense" },
-      { id: "depth", label: "RealSense Depth", avail: hasRealSenseBaseStreams, maskable: false },
-      ...manifestTabs,
+      { id: "legacy:color", label: "RGB", avail: !!currentTake.has_video, maskable: true, maskCameraId: "realsense", url: `/api/episodes/${selectedId}/takes/${selectedTake}/video_camera/realsense/color` },
+      { id: "legacy:depth", label: "Depth", avail: !!currentTake.has_video, maskable: false, url: `/api/episodes/${selectedId}/takes/${selectedTake}/video_camera/realsense/depth` },
+      { id: "legacy:webcam_0", label: "Cam0 Ego", avail: !!currentTake.has_webcam_0, maskable: true, maskCameraId: "cam0", url: `/api/episodes/${selectedId}/takes/${selectedTake}/video_camera/cam0/color` },
+      { id: "legacy:webcam_1", label: "Cam1 Overview", avail: !!currentTake.has_webcam_1, maskable: true, maskCameraId: "cam1", url: `/api/episodes/${selectedId}/takes/${selectedTake}/video_camera/cam1/color` },
     ];
-  }, [currentTake]);
+  }, [currentTake, selectedId, selectedTake]);
 
   const maskableCameraTabs = useMemo(
     () => cameraTabs.filter(tab => tab.avail && tab.maskable && tab.maskCameraId),
     [cameraTabs],
   );
+  const defaultMaskCameraId = maskableCameraTabs[0]?.maskCameraId ?? "";
 
   const videoSourceForMaskCamera = useCallback((cameraId: string) => {
     const tab = cameraTabs.find(t => t.maskCameraId === cameraId && t.avail);
@@ -681,16 +695,16 @@ export default function DatasetPage() {
 
   useEffect(() => {
     if (!editMeta) return;
-    setPostprocessMaskCameraId(editMeta.mask.camera_id || "cam1");
-  }, [editMeta]);
+    setPostprocessMaskCameraId(editMeta.mask.camera_id || defaultMaskCameraId);
+  }, [editMeta, defaultMaskCameraId]);
 
   useEffect(() => {
     if (inspectorTab !== "postprocess") return;
-    const target = editMeta?.mask.camera_id || postprocessMaskCameraId || maskableCameraTabs[0]?.maskCameraId;
+    const target = editMeta?.mask.camera_id || postprocessMaskCameraId || defaultMaskCameraId;
     if (!target) return;
     setPostprocessMaskCameraId(target);
     setVideoSource(videoSourceForMaskCamera(target));
-  }, [inspectorTab, editMeta, maskableCameraTabs, postprocessMaskCameraId, videoSourceForMaskCamera]);
+  }, [inspectorTab, editMeta, defaultMaskCameraId, postprocessMaskCameraId, videoSourceForMaskCamera]);
 
   const handleVideoSourceChange = useCallback((source: string) => {
     setVideoSource(source);
@@ -700,14 +714,15 @@ export default function DatasetPage() {
   }, [inspectorTab, maskCameraForVideoSource]);
 
   const videoUrl = useMemo(() => {
-    if (!selectedId || !selectedTake) return null;
-    const base = `/api/episodes/${selectedId}/takes/${selectedTake}`;
-    if (videoSource === "color") return `${base}/video`;
-    if (videoSource === "depth") return `${base}/video_depth`;
-    if (videoSource === "webcam_0") return `${base}/video_webcam_0`;
-    if (videoSource === "webcam_1") return `${base}/video_webcam_1`;
-    return `${base}/video_camera/${videoSource}`;
-  }, [selectedId, selectedTake, videoSource]);
+    return cameraTabs.find(t => t.id === videoSource && t.avail)?.url ?? null;
+  }, [cameraTabs, videoSource]);
+
+  useEffect(() => {
+    if (!cameraTabs.length) return;
+    if (!cameraTabs.some(t => t.id === videoSource && t.avail)) {
+      setVideoSource(cameraTabs.find(t => t.avail)?.id ?? cameraTabs[0].id);
+    }
+  }, [cameraTabs, videoSource]);
 
   const duration = takeDuration(jointsData);
   const selectedBatch = useMemo(
@@ -835,8 +850,16 @@ export default function DatasetPage() {
           exportingLerobot={exportingLerobot}
           includeFrames={includeFrames}
           lerobotPreset={lerobotPreset}
+          lerobotMaskMode={lerobotMaskMode}
+          maskFillColor={maskFillColor}
+          successOnly={exportSuccessOnly}
+          issuePolicy={exportIssuePolicy}
           onIncludeFrames={setIncludeFrames}
           onLerobotPreset={setLerobotPreset}
+          onLerobotMaskMode={setLerobotMaskMode}
+          onMaskFillColor={setMaskFillColor}
+          onSuccessOnly={setExportSuccessOnly}
+          onIssuePolicy={setExportIssuePolicy}
           onExportZip={exportSelected}
           onExportLerobot={exportLerobot}
           onClose={() => setExportModal(false)}
@@ -1034,7 +1057,9 @@ export default function DatasetPage() {
                         <SummaryItem label="Size" value={fmtMb(selected.size_mb)} />
                         <SummaryItem label="Created" value={fmtDate(selected.created_at)} />
                         <SummaryItem label="Postprocess" value={selected.has_postprocess ? "Enabled" : "None"} />
+                        <SummaryItem label="Review issues" value={String(selected.review_issue_count ?? 0)} />
                       </div>
+                      <ReviewIssueBadges issues={selected.review_issues} />
                     </div>
                   </div>
                   <div style={styles.workspaceCell}>
@@ -1245,7 +1270,7 @@ function EditPanel({
   React.useEffect(() => { setTrim(editMeta.trim); setMask(editMeta.mask); setDirty(false); }, [editMeta]);
   React.useEffect(() => {
     if (!selectedMaskCameraId) return;
-    const current = mask.camera_id || "cam1";
+    const current = mask.camera_id || selectedMaskCameraId;
     if (current === selectedMaskCameraId) return;
     setMask(p => ({ ...p, camera_id: selectedMaskCameraId, polygon: [] }));
     setDirty(true);
@@ -1253,7 +1278,7 @@ function EditPanel({
 
   const effectiveCutT = trim.cut_t ?? autoGripperOpenT;
   const trimEnd = effectiveCutT !== null ? effectiveCutT + trim.margin : null;
-  const targetCamera = mask.camera_id || selectedMaskCameraId || "cam1";
+  const targetCamera = mask.camera_id || selectedMaskCameraId;
 
   const save = () => { onSave({ trim, mask }); setDirty(false); };
 
@@ -1316,34 +1341,44 @@ function EditPanel({
                   )}
                 </div>
 
-                {/* margin 슬라이더 */}
+                {/* trim offset slider */}
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                  <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>여유 마진:</span>
-                  <input type="range" min={0} max={3} step={0.1}
+                  <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>컷 오프셋:</span>
+                  <input type="range" min={-2} max={3} step={0.1}
                     value={trim.margin}
                     onChange={e => { setTrim(p => ({ ...p, margin: parseFloat(e.target.value) })); setDirty(true); }}
                     style={{ flex: 1, accentColor: "#6366f1" }} />
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "#6366f1", minWidth: 32 }}>{trim.margin.toFixed(1)}s</span>
+                  <span style={{
+                    fontSize: 12,
+                    fontWeight: 700,
+                    color: trim.margin < 0 ? "#0f766e" : "#6366f1",
+                    minWidth: 44,
+                    textAlign: "right" as const,
+                  }}>{trim.margin > 0 ? "+" : ""}{trim.margin.toFixed(1)}s</span>
                 </div>
 
                 {/* 최종 trim 시각 표시 */}
                 {(() => {
                   const overDuration = trimEnd !== null && duration !== undefined && trimEnd > duration;
+                  const underDuration = trimEnd !== null && trimEnd < 0;
+                  const isWarning = overDuration || underDuration;
                   return (
                     <div style={{ fontSize: 12, borderRadius: 5, padding: "4px 8px", marginBottom: 6,
-                      background: overDuration ? "#fff7ed" : "#eef2ff",
-                      border: overDuration ? "1px solid #fed7aa" : "none" }}>
+                      background: isWarning ? "#fff7ed" : "#eef2ff",
+                      border: isWarning ? "1px solid #fed7aa" : "none" }}>
                       <div>
                         최종 컷: {trimEnd !== null
-                          ? <strong style={{ color: overDuration ? "#c2410c" : "#1d4ed8" }}>{trimEnd.toFixed(2)}s</strong>
+                          ? <strong style={{ color: isWarning ? "#c2410c" : "#1d4ed8" }}>{trimEnd.toFixed(2)}s</strong>
                           : "—"}
                         {effectiveCutT !== null && (
-                          <span style={{ color: "#94a3b8" }}> ({effectiveCutT.toFixed(2)} + {trim.margin.toFixed(1)}s)</span>
+                          <span style={{ color: "#94a3b8" }}> ({effectiveCutT.toFixed(2)} {trim.margin >= 0 ? "+" : "-"} {Math.abs(trim.margin).toFixed(1)}s)</span>
                         )}
                       </div>
                       {duration !== undefined && (
-                        <div style={{ marginTop: 2, color: overDuration ? "#c2410c" : "#94a3b8" }}>
-                          {overDuration
+                        <div style={{ marginTop: 2, color: isWarning ? "#c2410c" : "#94a3b8" }}>
+                          {underDuration
+                            ? "⚠ 최종 컷이 0초보다 앞입니다"
+                            : overDuration
                             ? `⚠ 영상 길이 ${duration.toFixed(1)}s 초과 → trim 효과 없음`
                             : `영상 길이: ${duration.toFixed(1)}s`}
                         </div>
@@ -1352,8 +1387,7 @@ function EditPanel({
                   );
                 })()}
 
-                {/* 컷 지점 webcam_1 프레임 미리보기 (joint 시간 기준) */}
-                {trimEnd !== null && (
+                {trimEnd !== null && targetCamera && (
                   <div>
                     <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>
                       컷 지점 프레임 (joint t={trimEnd.toFixed(2)}s):
@@ -1371,16 +1405,16 @@ function EditPanel({
               Video Mask
             </div>
             <div style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>
-              Target camera follows the active RGB camera tab: <strong style={{ color: "#15803d" }}>{targetCamera}</strong>
+              Target camera follows the active RGB camera tab: <strong style={{ color: "#15803d" }}>{targetCamera || "none"}</strong>
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 8, cursor: "pointer" }}>
-              <input type="checkbox" checked={mask.enabled}
+              <input type="checkbox" checked={mask.enabled} disabled={!targetCamera}
                 onChange={e => { setMask(p => ({ ...p, enabled: e.target.checked })); setDirty(true); }} />
               mask 활성화
             </label>
 
-            {mask.enabled && (
+            {mask.enabled && targetCamera && (
               <MaskPolygonEditor
                 episodeId={episodeId}
                 take={take}
@@ -1424,15 +1458,11 @@ function CameraFrame({
   const [url, setUrl] = React.useState("");
   const [loading, setLoading] = React.useState(false);
   const [failed, setFailed] = React.useState(false);
-  const [usedLegacyFallback, setUsedLegacyFallback] = React.useState(false);
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const makeFrameUrl = React.useCallback((legacy = false) => {
+  const makeFrameUrl = React.useCallback(() => {
     const t = tSec.toFixed(2);
     const cache = Date.now();
-    if (legacy) {
-      return `/api/episodes/${episodeId}/takes/${take}/frame_webcam1_at?t=${t}&ref=${tBase}&_=${cache}`;
-    }
     return `/api/episodes/${episodeId}/takes/${take}/frame_camera_at/${cameraId}?t=${t}&ref=${tBase}&_=${cache}`;
   }, [episodeId, take, cameraId, tSec, tBase]);
 
@@ -1440,9 +1470,8 @@ function CameraFrame({
     if (timerRef.current) clearTimeout(timerRef.current);
     setLoading(true);  // tSec 변경 즉시 dim → 로딩 중 피드백
     setFailed(false);
-    setUsedLegacyFallback(false);
     timerRef.current = setTimeout(() => {
-      setUrl(makeFrameUrl(false));
+      setUrl(makeFrameUrl());
     }, 200);
     return () => { if (timerRef.current) clearTimeout(timerRef.current); };
   }, [makeFrameUrl]);
@@ -1461,12 +1490,6 @@ function CameraFrame({
             }
           }}
           onError={() => {
-            const canFallback = !usedLegacyFallback && (cameraId === "cam1" || cameraId === "webcam_1");
-            if (canFallback) {
-              setUsedLegacyFallback(true);
-              setUrl(makeFrameUrl(true));
-              return;
-            }
             setLoading(false);
             setFailed(true);
           }}
@@ -1527,10 +1550,7 @@ function MaskPolygonEditor({
 
   // 프레임 캡쳐 마스크: 캡쳐 기준 프레임 URL
   const frameUrl = React.useCallback((t: number) => {
-    const endpoint = cameraId === "cam1" || cameraId === "webcam_1"
-      ? "frame_webcam1_at"
-      : `frame_camera_at/${cameraId}`;
-    return `/api/episodes/${episodeId}/takes/${take}/${endpoint}?t=${t.toFixed(2)}&ref=video`;
+    return `/api/episodes/${episodeId}/takes/${take}/frame_camera_at/${cameraId}?t=${t.toFixed(2)}&ref=video`;
   }, [episodeId, take, cameraId]);
 
   const captureFrameUrl = React.useMemo(() => {

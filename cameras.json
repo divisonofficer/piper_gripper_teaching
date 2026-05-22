@@ -10,6 +10,7 @@
       "device": "auto:C270:0",
       "streams": ["color"],
       "legacy_id": "webcam_0",
+      "aliases": ["webcam_0"],
       "export_presets": ["default", "all", "debug"]
     },
     {
@@ -21,6 +22,7 @@
       "device": "auto:C270:1",
       "streams": ["color"],
       "legacy_id": "webcam_1",
+      "aliases": ["webcam_1"],
       "export_presets": ["default", "all", "debug"]
     },
     {
@@ -32,6 +34,7 @@
       "device": "auto",
       "streams": ["color", "depth"],
       "legacy_id": "realsense",
+      "aliases": ["realsense_depth"],
       "export_presets": ["all", "debug"]
     }
   ]

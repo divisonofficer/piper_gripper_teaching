@@ -125,8 +125,35 @@ export interface EpisodeTake {
     role?: string;
     legacy_id?: string;
     video: string;
+    streams?: Array<{
+      id: string;
+      label: string;
+      kind: string;
+      video: string;
+      url: string;
+      maskable: boolean;
+    }>;
   }>;
   size_mb?: number;
+  review_issues?: ReviewIssue[];
+  review_issue_count?: number;
+}
+
+export interface ReviewIssue {
+  key: string;
+  label: string;
+  severity?: "info" | "warning" | "danger";
+  source?: string;
+  lerobot_index?: number;
+  task_key?: string;
+  status?: "open" | "auto_fixed" | "needs_review" | "resolved";
+  note?: string;
+  suggested_actions?: Array<{
+    type: "mark_failure" | "trim" | "set_mask" | string;
+    params?: Record<string, unknown>;
+  }>;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface CameraManifestEntry {
@@ -158,6 +185,8 @@ export interface Episode {
   preview_video_url?: string | null;
   completeness?: Record<string, boolean>;
   has_postprocess?: boolean;  // 마지막 take에 활성화된 postprocess 편집이 있는지
+  review_issues?: ReviewIssue[];
+  review_issue_count?: number;
   // 구버전 호환
   stats?: Record<string, number>;
   checklist?: Record<string, boolean>;
@@ -191,12 +220,12 @@ export interface TakeTrajectoryData {
 export interface TrimMeta {
   enabled: boolean;
   cut_t: number | null;   // gripper open 시각 (null = 자동 감지)
-  margin: number;          // gripper open 이후 추가 유지 시간(초)
+  margin: number;          // cut_t 기준 offset(초). 음수면 open signal 이전에 자름
 }
 
 export interface MaskMeta {
   enabled: boolean;
-  camera_id?: string;  // target RGB camera id/alias. Default: cam1 for legacy edit_meta
+  camera_id?: string;  // target RGB camera id/alias. Defaults to manifest role=overview
   polygon: [number, number][];  // normalized 0-1 좌표 (keep 영역 폴리곤)
   fill: "black" | "frame_capture";
   capture_t?: number;  // frame_capture 타입: 캡쳐 기준 시각(초)

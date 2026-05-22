@@ -671,16 +671,31 @@ class EpisodeManager:
             has_video = os.path.exists(os.path.join(take_dir, "video.mp4"))
             has_teach = os.path.exists(os.path.join(take_dir, "teach_joint.csv"))
             manifest = load_manifest()
+            episode_id = os.path.basename(ep_dir)
             camera_videos = {}
             for cam in manifest.get("cameras", []):
-                color_file = video_file_name(cam, "color")
-                if os.path.exists(os.path.join(take_dir, color_file)):
+                streams = []
+                for stream in cam.get("streams", ["color"]):
+                    video_file = video_file_name(cam, stream)
+                    if not os.path.exists(os.path.join(take_dir, video_file)):
+                        continue
+                    streams.append({
+                        "id": stream,
+                        "label": "Depth" if stream == "depth" else "Color",
+                        "kind": stream,
+                        "video": video_file,
+                        "url": f"/api/episodes/{episode_id}/takes/{take_name}/video_camera/{cam['id']}/{stream}",
+                        "maskable": stream == "color",
+                    })
+                if streams:
+                    color_stream = next((s for s in streams if s["kind"] == "color"), streams[0])
                     camera_videos[cam["id"]] = {
                         "id": cam["id"],
                         "label": cam.get("label", cam["id"]),
                         "role": cam.get("role", ""),
                         "legacy_id": legacy_id_for(cam),
-                        "video": color_file,
+                        "video": color_stream["video"],
+                        "streams": streams,
                     }
             take_info = {
                 "take":        take_name,
@@ -690,9 +705,29 @@ class EpisodeManager:
                 "has_webcam_1": os.path.exists(os.path.join(take_dir, "video_webcam_1.mp4")),
                 "cameras":      list(camera_videos.values()),
                 "size_mb":     self._dir_size_mb(take_dir),
+                "review_issues": self._load_review_issues(take_dir),
             }
+            take_info["review_issue_count"] = len(take_info["review_issues"])
             takes.append(take_info)
         return takes
+
+    @staticmethod
+    def _load_review_issues(take_dir: str) -> list[dict]:
+        path = os.path.join(take_dir, "review_issues.json")
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(data, dict):
+            issues = data.get("issues", [])
+        else:
+            issues = data
+        if not isinstance(issues, list):
+            return []
+        return [i for i in issues if isinstance(i, dict)]
 
     def get_episode_meta(self, episode_id: str) -> Optional[dict]:
         meta_path = os.path.join(self.dataset_path, episode_id, "meta.json")

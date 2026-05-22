@@ -6,4 +6,9 @@ eventlet
 opencv-python-headless
 numpy
 scipy
+pandas
+pyarrow
+imageio-ffmpeg
+pillow
+cryptography
 pyrealsense2

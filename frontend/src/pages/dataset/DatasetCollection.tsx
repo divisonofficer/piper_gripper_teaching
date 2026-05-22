@@ -1,5 +1,5 @@
 import React from "react";
-import type { Episode } from "../../types";
+import type { Episode, ReviewIssue } from "../../types";
 import { COMPLETENESS, fmtDate, fmtDuration, fmtMb, statusLabel, type ViewMode } from "./datasetUtils";
 
 export function CompletenessChips({ ep }: { ep: Episode }) {
@@ -23,6 +23,34 @@ export function CompletenessChips({ ep }: { ep: Episode }) {
           </span>
         );
       })}
+    </div>
+  );
+}
+
+export function ReviewIssueBadges({ issues, compact = false }: { issues?: ReviewIssue[]; compact?: boolean }) {
+  if (!issues?.length) return null;
+  const visible = compact ? issues.slice(0, 2) : issues;
+  return (
+    <div style={styles.issueRow}>
+      {visible.map(issue => (
+        <span
+          key={`${issue.key}-${issue.lerobot_index ?? ""}`}
+          title={[issue.label, issue.note, issue.status].filter(Boolean).join(" · ")}
+          style={{
+            ...styles.issueBadge,
+            background: issue.severity === "danger" ? "#fee2e2" : issue.severity === "warning" ? "#fff7ed" : "#eef2ff",
+            color: issue.severity === "danger" ? "#b91c1c" : issue.severity === "warning" ? "#c2410c" : "#3730a3",
+            borderColor: issue.severity === "danger" ? "#fecaca" : issue.severity === "warning" ? "#fed7aa" : "#c7d2fe",
+          }}
+        >
+          {issue.label}
+        </span>
+      ))}
+      {compact && issues.length > visible.length && (
+        <span style={{ ...styles.issueBadge, background: "#f1f5f9", color: "#64748b", borderColor: "#e2e8f0" }}>
+          +{issues.length - visible.length}
+        </span>
+      )}
     </div>
   );
 }
@@ -109,6 +137,7 @@ export function EpisodeCollectionItem({
         <span style={styles.compactMeta}>{ep.takes_count ?? 0}t</span>
         <span style={styles.compactMeta}>{fmtDuration(ep.duration_s ?? undefined)}</span>
         <span style={styles.compactMeta}>{fmtMb(ep.size_mb)}</span>
+        {ep.review_issue_count ? <span style={styles.issueCount}>Issues {ep.review_issue_count}</span> : null}
       </div>
     );
   }
@@ -122,6 +151,7 @@ export function EpisodeCollectionItem({
         <VideoThumb src={ep.preview_video_url} active={activePreview} label={ep.episode_id} success={ep.success} style={{ width: "100%" }} />
         <div style={styles.gridTask}>{ep.task || "unspecified"}</div>
         <div style={styles.gridMeta}>{ep.takes_count ?? 0}t · {fmtDuration(ep.duration_s ?? undefined)} · {fmtMb(ep.size_mb)}</div>
+        <ReviewIssueBadges issues={ep.review_issues} compact />
         <CompletenessChips ep={ep} />
       </div>
     );
@@ -142,6 +172,7 @@ export function EpisodeCollectionItem({
         <div style={styles.thumbMeta}>
           {ep.takes_count ?? 0} take · {fmtDuration(ep.duration_s ?? undefined)} · {fmtMb(ep.size_mb)} · {fmtDate(ep.created_at)}
         </div>
+        <ReviewIssueBadges issues={ep.review_issues} compact />
         <CompletenessChips ep={ep} />
       </div>
       <button onClick={e => onDelete(ep.episode_id, e)} style={styles.rowDeleteBtn} title="Delete episode">×</button>
@@ -162,6 +193,25 @@ const styles: Record<string, React.CSSProperties> = {
   thumbTask: { fontSize: 13, color: "#111827", fontWeight: 700, marginTop: 5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   thumbMeta: { fontSize: 11, color: "#64748b", marginTop: 4 },
   postprocessBadge: { fontSize: 9, background: "#dbeafe", color: "#1d4ed8", borderRadius: 3, padding: "1px 5px", fontWeight: 800 },
+  issueRow: { display: "flex", gap: 4, flexWrap: "wrap", marginTop: 6 },
+  issueBadge: {
+    border: "1px solid #c7d2fe",
+    borderRadius: 5,
+    padding: "1px 5px",
+    fontSize: 9,
+    fontWeight: 900,
+    lineHeight: 1.45,
+  },
+  issueCount: {
+    gridColumn: "1 / -1",
+    justifySelf: "start",
+    borderRadius: 5,
+    padding: "1px 5px",
+    background: "#fff7ed",
+    color: "#c2410c",
+    fontSize: 9,
+    fontWeight: 900,
+  },
   rowDeleteBtn: { width: 24, height: 24, borderRadius: 5, border: "none", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 16, lineHeight: 1, flexShrink: 0 },
   videoThumb: {
     position: "relative", width: 104, aspectRatio: "16 / 9", borderRadius: 8,

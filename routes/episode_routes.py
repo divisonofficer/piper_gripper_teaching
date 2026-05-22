@@ -22,10 +22,12 @@ Episode 관리 API
 import csv as csv_module
 import json
 import os
+import uuid
+from datetime import datetime
 from typing import Optional
 
 from flask import Blueprint, current_app, jsonify, request, send_file, abort
-from camera_manifest import camera_by_id, overview_camera, video_file_name, camera_csv_name, frames_dir_name
+from camera_manifest import camera_by_id, default_mask_camera_id, overview_camera, video_file_name, camera_csv_name, frames_dir_name
 
 bp = Blueprint("episodes", __name__, url_prefix="/api/episodes")
 
@@ -46,6 +48,113 @@ def _take_dir(episode_id: str, take: Optional[str] = None) -> Optional[str]:
         d = os.path.join(DATASET_PATH, episode_id, "takes", take)
         return d if os.path.isdir(d) else None
     return mgr.get_latest_take_dir(episode_id)
+
+
+def _latest_take_name(episode_id: str) -> str | None:
+    td = _take_dir(episode_id)
+    return os.path.basename(td) if td else None
+
+
+def _review_issues_path(episode_id: str, take: str) -> str | None:
+    td = _take_dir(episode_id, take)
+    if not td:
+        return None
+    return os.path.join(td, "review_issues.json")
+
+
+def _load_review_issues_file(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    issues = data.get("issues", []) if isinstance(data, dict) else data
+    if not isinstance(issues, list):
+        return []
+    return [i for i in issues if isinstance(i, dict)]
+
+
+def _save_review_issues_file(path: str, issues: list[dict]) -> None:
+    with open(path, "w") as f:
+        json.dump(issues, f, ensure_ascii=False, indent=2)
+
+
+def _normalize_review_issue(raw: dict) -> dict:
+    key = str(raw.get("key") or raw.get("issue_id") or f"issue_{uuid.uuid4().hex[:12]}")
+    now = datetime.now().isoformat()
+    issue = {
+        "key": key,
+        "label": str(raw.get("label") or key.replace("_", " ")),
+        "severity": str(raw.get("severity") or "warning"),
+        "source": str(raw.get("source") or "manual"),
+        "status": str(raw.get("status") or "open"),
+        "note": str(raw.get("note") or ""),
+        "created_at": str(raw.get("created_at") or now),
+        "updated_at": now,
+    }
+    for optional in ("task_key", "lerobot_index", "suggested_actions"):
+        if optional in raw:
+            issue[optional] = raw[optional]
+    return issue
+
+
+def _episode_label_path(episode_id: str) -> str:
+    from config import DATASET_PATH
+    return os.path.join(DATASET_PATH, episode_id, "label.json")
+
+
+def _set_episode_success(episode_id: str, success: bool, reason: str = "") -> bool:
+    from config import DATASET_PATH
+    ep_dir = os.path.join(DATASET_PATH, episode_id)
+    if not os.path.isdir(ep_dir):
+        return False
+    takes_dir = os.path.join(ep_dir, "takes")
+    takes = sorted(d for d in os.listdir(takes_dir) if os.path.isdir(os.path.join(takes_dir, d))) if os.path.isdir(takes_dir) else []
+    label = {
+        "success": bool(success),
+        "failure_reason": "" if success else reason,
+        "labeled_at": datetime.now().isoformat(),
+        "takes": takes,
+    }
+    with open(os.path.join(ep_dir, "label.json"), "w") as f:
+        json.dump(label, f, ensure_ascii=False, indent=2)
+    meta_path = os.path.join(ep_dir, "meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        if not isinstance(meta.get("task"), dict):
+            meta["task"] = {}
+        meta["task"]["success"] = bool(success)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def _episode_success(episode_id: str) -> bool | None:
+    path = _episode_label_path(episode_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            label = json.load(f)
+        return label.get("success")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _has_open_review_issues(episode_id: str) -> bool:
+    take = _latest_take_name(episode_id)
+    if not take:
+        return False
+    path = _review_issues_path(episode_id, take)
+    if not path:
+        return False
+    return any(i.get("status", "open") in {"open", "needs_review"} for i in _load_review_issues_file(path))
 
 
 def _video_duration_s(path: str) -> float | None:
@@ -121,6 +230,9 @@ def list_episodes():
             ep["preview_video_url"] = f"/api/episodes/{ep_id}/preview_video" if preview_path else None
             ep["duration_s"] = _video_duration_s(preview_path) if preview_path else None
             ep["completeness"] = _take_completeness(td, ep.get("success"))
+            latest_take_info = next((t for t in ep.get("takes", []) if t.get("take") == latest_take), None)
+            ep["review_issues"] = (latest_take_info or {}).get("review_issues", [])
+            ep["review_issue_count"] = len(ep["review_issues"])
         else:
             ep["preview_video_url"] = None
             ep["duration_s"] = None
@@ -128,6 +240,8 @@ def list_episodes():
                 "rgb": False, "depth": False, "cam0": False, "cam1": False,
                 "joints": False, "traj": False, "label": ep.get("success") is not None,
             }
+            ep["review_issues"] = []
+            ep["review_issue_count"] = 0
     return jsonify(episodes)
 
 
@@ -196,6 +310,146 @@ def delete_take(episode_id: str, take: str):
     if not ok:
         return abort(404)
     return jsonify({"ok": True})
+
+
+# ── Dataset QA / review issues ────────────────────────────────────────
+
+@bp.get("/<episode_id>/takes/<take>/review_issues")
+def get_review_issues(episode_id: str, take: str):
+    path = _review_issues_path(episode_id, take)
+    if not path:
+        return abort(404)
+    return jsonify({"issues": _load_review_issues_file(path)})
+
+
+@bp.post("/<episode_id>/takes/<take>/review_issues")
+def add_review_issues(episode_id: str, take: str):
+    path = _review_issues_path(episode_id, take)
+    if not path:
+        return abort(404)
+    data = request.get_json(silent=True) or {}
+    raw_issues = data.get("issues", data)
+    if isinstance(raw_issues, dict):
+        raw_issues = [raw_issues]
+    if not isinstance(raw_issues, list):
+        return abort(400)
+    current = _load_review_issues_file(path)
+    by_key = {i.get("key"): i for i in current}
+    for raw in raw_issues:
+        if not isinstance(raw, dict):
+            continue
+        issue = _normalize_review_issue(raw)
+        by_key[issue["key"]] = {**by_key.get(issue["key"], {}), **issue}
+    issues = list(by_key.values())
+    _save_review_issues_file(path, issues)
+    return jsonify({"issues": issues})
+
+
+@bp.patch("/<episode_id>/takes/<take>/review_issues/<issue_key>")
+def update_review_issue(episode_id: str, take: str, issue_key: str):
+    path = _review_issues_path(episode_id, take)
+    if not path:
+        return abort(404)
+    data = request.get_json(silent=True) or {}
+    issues = _load_review_issues_file(path)
+    found = False
+    for issue in issues:
+        if issue.get("key") == issue_key:
+            for field in ("label", "severity", "source", "status", "note", "suggested_actions"):
+                if field in data:
+                    issue[field] = data[field]
+            issue["updated_at"] = datetime.now().isoformat()
+            found = True
+            break
+    if not found:
+        return abort(404)
+    _save_review_issues_file(path, issues)
+    return jsonify({"issues": issues})
+
+
+def _load_edit_meta(episode_id: str, take: str) -> tuple[str, dict] | tuple[None, None]:
+    td = _take_dir(episode_id, take)
+    if not td:
+        return None, None
+    path = os.path.join(td, "edit_meta.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+    else:
+        meta = {}
+    meta.setdefault("trim", {"enabled": False, "cut_t": None, "margin": 1.0})
+    meta.setdefault("mask", {"enabled": False, "camera_id": default_mask_camera_id() or "", "polygon": [], "fill": "black"})
+    return path, meta
+
+
+def _apply_review_action(episode_id: str, take: str, issue: dict, action: dict) -> str:
+    action_type = action.get("type")
+    params = action.get("params", {}) if isinstance(action.get("params"), dict) else {}
+    if action_type == "mark_failure":
+        reason = params.get("reason") or issue.get("note") or issue.get("label") or "review issue marked failure"
+        if not _set_episode_success(episode_id, False, str(reason)):
+            return "failed"
+        return "applied"
+    if action_type == "trim":
+        path, meta = _load_edit_meta(episode_id, take)
+        if not path or meta is None:
+            return "failed"
+        trim = meta.setdefault("trim", {})
+        trim["enabled"] = True
+        if "cut_t" in params:
+            trim["cut_t"] = params["cut_t"]
+        if "margin" in params:
+            trim["margin"] = params["margin"]
+        with open(path, "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        return "applied"
+    if action_type == "set_mask":
+        path, meta = _load_edit_meta(episode_id, take)
+        if not path or meta is None:
+            return "failed"
+        mask = meta.setdefault("mask", {})
+        mask.update(params)
+        with open(path, "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        return "applied"
+    return "unsupported"
+
+
+@bp.post("/review_issues/apply")
+def apply_review_issues():
+    data = request.get_json(silent=True) or {}
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return abort(400)
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        episode_id = str(item.get("episode_id", ""))
+        take = str(item.get("take") or _latest_take_name(episode_id) or "")
+        issue_key = item.get("issue_key")
+        path = _review_issues_path(episode_id, take) if episode_id and take else None
+        if not path:
+            results.append({"episode_id": episode_id, "take": take, "status": "missing_take"})
+            continue
+        issues = _load_review_issues_file(path)
+        selected = [i for i in issues if not issue_key or i.get("key") == issue_key]
+        for issue in selected:
+            actions = issue.get("suggested_actions", [])
+            if isinstance(actions, dict):
+                actions = [actions]
+            applied = [_apply_review_action(episode_id, take, issue, a) for a in actions if isinstance(a, dict)]
+            if applied and all(s == "applied" for s in applied):
+                issue["status"] = "auto_fixed"
+            elif applied:
+                issue["status"] = "needs_review"
+            issue["updated_at"] = datetime.now().isoformat()
+            results.append({"episode_id": episode_id, "take": take, "issue_key": issue.get("key"), "actions": applied})
+        _save_review_issues_file(path, issues)
+    return jsonify({"results": results})
 
 
 # ── Video serving ──────────────────────────────────────────────────────
@@ -269,6 +523,20 @@ def get_video_camera(episode_id: str, cam_id: str):
     return send_file(path, mimetype="video/mp4")
 
 
+@bp.get("/<episode_id>/video_camera/<cam_id>/<stream>")
+def get_video_camera_stream(episode_id: str, cam_id: str, stream: str):
+    td = _take_dir(episode_id)
+    if not td:
+        return abort(404)
+    cam = camera_by_id(cam_id)
+    if not cam or stream not in cam.get("streams", ["color"]):
+        return abort(404)
+    path = os.path.join(td, video_file_name(cam, stream))
+    if not os.path.exists(path):
+        return abort(404)
+    return send_file(path, mimetype="video/mp4")
+
+
 @bp.get("/<episode_id>/takes/<take>/video")
 def get_take_video(episode_id: str, take: str):
     td = _take_dir(episode_id, take)
@@ -333,6 +601,20 @@ def get_take_video_camera(episode_id: str, take: str, cam_id: str):
     if not cam:
         return abort(404)
     path = os.path.join(td, video_file_name(cam, "color"))
+    if not os.path.exists(path):
+        return abort(404)
+    return send_file(path, mimetype="video/mp4")
+
+
+@bp.get("/<episode_id>/takes/<take>/video_camera/<cam_id>/<stream>")
+def get_take_video_camera_stream(episode_id: str, take: str, cam_id: str, stream: str):
+    td = _take_dir(episode_id, take)
+    if not td:
+        return abort(404)
+    cam = camera_by_id(cam_id)
+    if not cam or stream not in cam.get("streams", ["color"]):
+        return abort(404)
+    path = os.path.join(td, video_file_name(cam, stream))
     if not os.path.exists(path):
         return abort(404)
     return send_file(path, mimetype="video/mp4")
@@ -430,17 +712,32 @@ def export_lerobot():
     """선택 에피소드를 LeRobot v2.0 형식 ZIP으로 변환·제공."""
     import io, zipfile, tempfile
     from converters.lerobot_converter import convert_episodes
-    from config import DATASET_PATH
+    from config import DATASET_PATH, POSTPROCESS_DEFAULT_MASK_FILL_COLOR
 
     data = request.get_json(silent=True) or {}
     episode_ids: list[str] = data.get("episode_ids", [])
+    if not episode_ids:
+        return abort(400)
+    if data.get("success_only"):
+        episode_ids = [ep_id for ep_id in episode_ids if _episode_success(ep_id) is True]
+    if data.get("issue_policy") == "exclude_open":
+        episode_ids = [ep_id for ep_id in episode_ids if not _has_open_review_issues(ep_id)]
     if not episode_ids:
         return abort(400)
 
     with tempfile.TemporaryDirectory() as tmp:
         out_dir = os.path.join(tmp, "lerobot")
         preset = data.get("preset", data.get("export_preset", "default"))
-        convert_episodes(episode_ids, DATASET_PATH, out_dir, export_preset=preset)
+        mask_mode = data.get("mask_mode", "edit")
+        mask_fill_color = data.get("mask_fill_color", POSTPROCESS_DEFAULT_MASK_FILL_COLOR)
+        convert_episodes(
+            episode_ids,
+            DATASET_PATH,
+            out_dir,
+            export_preset=preset,
+            mask_mode=mask_mode,
+            mask_fill_color=mask_fill_color,
+        )
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
@@ -580,7 +877,10 @@ def get_take_frame_webcam1_at(episode_id: str, take: str):
     t_sec = float(request.args.get("t", 0))
     ref = request.args.get("ref", "video")  # "video" | "camera"
 
-    return _send_camera_frame_at(episode_id, take, "cam1", t_sec, ref)
+    cam_id = default_mask_camera_id()
+    if not cam_id:
+        return abort(404)
+    return _send_camera_frame_at(episode_id, take, cam_id, t_sec, ref)
 
 
 @bp.get("/<episode_id>/takes/<take>/frame_camera_at/<cam_id>")
@@ -593,12 +893,14 @@ def get_take_frame_camera_at(episode_id: str, take: str, cam_id: str):
 def _send_camera_frame_at(episode_id: str, take: str, cam_id: str, t_sec: float, ref: str):
     from config import DATASET_PATH
     td = os.path.join(DATASET_PATH, episode_id, "takes", take)
-    cam = camera_by_id(cam_id) or overview_camera()
-    frames_dir = os.path.join(td, frames_dir_name(cam)) if cam else os.path.join(td, "frames_webcam_1")
+    cam = camera_by_id(cam_id)
+    if not cam:
+        return abort(404)
+    frames_dir = os.path.join(td, frames_dir_name(cam))
     if not os.path.isdir(frames_dir):
         return abort(404)
 
-    cam_csv_path = os.path.join(td, camera_csv_name(cam)) if cam else os.path.join(td, "camera_frames_webcam_1.csv")
+    cam_csv_path = os.path.join(td, camera_csv_name(cam))
     frame_idx = 0
     if os.path.exists(cam_csv_path):
         with open(cam_csv_path) as f:
@@ -606,7 +908,7 @@ def _send_camera_frame_at(episode_id: str, take: str, cam_id: str, t_sec: float,
         if rows:
             if ref == "video":
                 # 비디오 시간을 카메라 프레임 비율로 변환.
-                video_duration = _get_video_duration(os.path.join(td, video_file_name(cam, "color"))) if cam else None
+                video_duration = _get_video_duration(os.path.join(td, video_file_name(cam, "color")))
                 if video_duration and video_duration > 0:
                     frac = max(0.0, min(1.0, t_sec / video_duration))
                     row_idx = int(round(frac * (len(rows) - 1)))
@@ -636,7 +938,7 @@ def get_edit_meta(episode_id: str, take: str):
     path = os.path.join(td, "edit_meta.json")
     if not os.path.exists(path):
         return jsonify({"trim": {"enabled": False, "cut_t": None, "margin": 1.0},
-                        "mask": {"enabled": False, "camera_id": "cam1", "polygon": [], "fill": "black"}})
+                        "mask": {"enabled": False, "camera_id": default_mask_camera_id() or "", "polygon": [], "fill": "black"}})
     with open(path) as f:
         return jsonify(json.load(f))
 

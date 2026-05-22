@@ -6,8 +6,16 @@ interface ExportModalProps {
   exportingLerobot: boolean;
   includeFrames: boolean;
   lerobotPreset: "default" | "all" | "debug";
+  lerobotMaskMode: "edit" | "off";
+  maskFillColor: string;
+  successOnly: boolean;
+  issuePolicy: "include_all" | "exclude_open";
   onIncludeFrames: (value: boolean) => void;
   onLerobotPreset: (value: "default" | "all" | "debug") => void;
+  onLerobotMaskMode: (value: "edit" | "off") => void;
+  onMaskFillColor: (value: string) => void;
+  onSuccessOnly: (value: boolean) => void;
+  onIssuePolicy: (value: "include_all" | "exclude_open") => void;
   onExportZip: () => void;
   onExportLerobot: () => void;
   onClose: () => void;
@@ -19,8 +27,16 @@ export default function ExportModal({
   exportingLerobot,
   includeFrames,
   lerobotPreset,
+  lerobotMaskMode,
+  maskFillColor,
+  successOnly,
+  issuePolicy,
   onIncludeFrames,
   onLerobotPreset,
+  onLerobotMaskMode,
+  onMaskFillColor,
+  onSuccessOnly,
+  onIssuePolicy,
   onExportZip,
   onExportLerobot,
   onClose,
@@ -36,6 +52,11 @@ export default function ExportModal({
           Raw 프레임 이미지 포함 (용량 큼)
         </label>
 
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" checked={successOnly} onChange={e => onSuccessOnly(e.target.checked)} />
+          Success 라벨만 LeRobot export
+        </label>
+
         <label style={styles.selectLabel}>
           LeRobot camera preset
           <select
@@ -48,6 +69,42 @@ export default function ExportModal({
             <option value="debug">debug · cam0 + cam1 + depth sensor RGB</option>
           </select>
         </label>
+
+        <label style={styles.selectLabel}>
+          Mask mode
+          <select
+            value={lerobotMaskMode}
+            onChange={e => onLerobotMaskMode(e.target.value as "edit" | "off")}
+            style={styles.select}
+          >
+            <option value="edit">apply saved masks</option>
+            <option value="off">no masking</option>
+          </select>
+        </label>
+
+        <label style={styles.selectLabel}>
+          Review issue policy
+          <select
+            value={issuePolicy}
+            onChange={e => onIssuePolicy(e.target.value as "include_all" | "exclude_open")}
+            style={styles.select}
+          >
+            <option value="include_all">include selected episodes</option>
+            <option value="exclude_open">exclude open / needs-review issues</option>
+          </select>
+        </label>
+
+        {lerobotMaskMode === "edit" && (
+          <label style={styles.selectLabel}>
+            Solid mask fill color
+            <input
+              type="text"
+              value={maskFillColor}
+              onChange={e => onMaskFillColor(e.target.value)}
+              style={styles.select}
+            />
+          </label>
+        )}
 
         <div style={styles.actions}>
           <button onClick={() => { onExportZip(); onClose(); }} disabled={exporting} style={{ ...styles.primaryButton, background: "#6366f1" }}>

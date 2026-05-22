@@ -20,7 +20,7 @@ from flask_socketio import SocketIO
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-from config import FLASK_HOST, FLASK_PORT, FLASK_DEBUG
+from config import FLASK_HOST, FLASK_PORT, FLASK_DEBUG, HTTPS_PORT
 from controller import Controller
 
 # ── Flask 초기화 ──────────────────────────────────────────────────────
@@ -801,10 +801,17 @@ def serve_spa(path=""):
 
 # ── 종료 처리 ─────────────────────────────────────────────────────────
 
+_SHUTTING_DOWN = False
+
+
 def _shutdown(sig, frame):
+    global _SHUTTING_DOWN
+    if _SHUTTING_DOWN:
+        return
+    _SHUTTING_DOWN = True
     print("\n[app] Shutting down...")
     controller.shutdown()
-    sys.exit(0)
+    raise SystemExit(0)
 
 
 signal.signal(signal.SIGINT, _shutdown)
@@ -899,9 +906,6 @@ def _get_ssl_context():
             return None, "http"
 
     return (cert_path, key_path), "https"
-
-
-HTTPS_PORT = 5003  # 모바일 전용 HTTPS 포트
 
 
 def _run_https_server(ssl_context):

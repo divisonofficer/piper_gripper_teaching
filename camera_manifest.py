@@ -19,6 +19,7 @@ DEFAULT_MANIFEST: dict[str, Any] = {
             "device": "auto:C270:0",
             "streams": ["color"],
             "legacy_id": "webcam_0",
+            "aliases": ["webcam_0"],
             "export_presets": ["default", "all", "debug"],
         },
         {
@@ -30,6 +31,7 @@ DEFAULT_MANIFEST: dict[str, Any] = {
             "device": "auto:C270:1",
             "streams": ["color"],
             "legacy_id": "webcam_1",
+            "aliases": ["webcam_1"],
             "export_presets": ["default", "all", "debug"],
         },
         {
@@ -41,6 +43,7 @@ DEFAULT_MANIFEST: dict[str, Any] = {
             "device": "auto",
             "streams": ["color", "depth"],
             "legacy_id": "realsense",
+            "aliases": ["realsense_depth"],
             "export_presets": ["all", "debug"],
         },
     ],
@@ -62,6 +65,12 @@ def _normalize_camera(cam: dict[str, Any]) -> dict[str, Any]:
     out["streams"] = [str(s) for s in streams] if isinstance(streams, list) else ["color"]
     legacy_id = out.get("legacy_id")
     out["legacy_id"] = str(legacy_id) if legacy_id else out["id"]
+    aliases = out.get("aliases", [])
+    out["aliases"] = [str(a) for a in aliases] if isinstance(aliases, list) else []
+    if "depth" in out["streams"]:
+        depth_alias = f"{out['id']}_depth"
+        if depth_alias not in out["aliases"]:
+            out["aliases"].append(depth_alias)
     presets = out.get("export_presets", [])
     out["export_presets"] = [str(p) for p in presets] if isinstance(presets, list) else []
     return out
@@ -127,12 +136,7 @@ def camera_aliases(cam: dict[str, Any]) -> set[str]:
     legacy_id = cam.get("legacy_id")
     if legacy_id:
         aliases.add(str(legacy_id))
-    if cam["id"] == "cam0":
-        aliases.add("webcam_0")
-    if cam["id"] == "cam1":
-        aliases.add("webcam_1")
-    if cam["id"] == "realsense":
-        aliases.update({"realsense", "realsense_depth"})
+    aliases.update(str(alias) for alias in cam.get("aliases", []) if alias)
     return aliases
 
 
@@ -190,4 +194,13 @@ def overview_camera(manifest: dict[str, Any] | None = None) -> dict[str, Any] | 
     for cam in manifest["cameras"]:
         if cam.get("role") == "overview":
             return cam
-    return camera_by_id("cam1", manifest)
+    return next((cam for cam in manifest["cameras"] if "color" in cam.get("streams", [])), None)
+
+
+def default_mask_camera(manifest: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    return overview_camera(manifest)
+
+
+def default_mask_camera_id(manifest: dict[str, Any] | None = None) -> str | None:
+    cam = default_mask_camera(manifest)
+    return cam.get("id") if cam else None

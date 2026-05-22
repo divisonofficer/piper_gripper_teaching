@@ -1,8 +1,15 @@
 import os
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
 # CAN / ROS2
-CAN_PORT = "can1"
-CAN_BITRATE = 1000000
+CAN_PORT = os.getenv("CAN_PORT", "can1")
+CAN_BITRATE = _env_int("CAN_BITRATE", 1000000)
 ROS_PIPER_JOINT_STATE_TOPIC = "/joint_states_single"
 ROS_PIPER_JOINT_CTRL_TOPIC = "/joint_ctrl_single"
 
@@ -47,10 +54,14 @@ GRIPPER_STEP_DELAY = 0.08        # 각 단계 간 대기 시간 (초)
 SAFE_RETURN_WAYPOINTS = None
 
 # Dataset
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "dataset")
+DATASET_PATH = os.getenv("DATASET_PATH", os.path.join(os.path.dirname(__file__), "dataset"))
 JOINT_LIMITS_FILE = os.path.join(DATASET_PATH, "joint_limits.json")
 
+# Postprocess defaults
+POSTPROCESS_DEFAULT_MASK_FILL_COLOR = "#000000"
+
 # Flask
-FLASK_PORT = 5002
-FLASK_HOST = "0.0.0.0"
-FLASK_DEBUG = False
+FLASK_PORT = _env_int("FLASK_PORT", 5002)
+HTTPS_PORT = _env_int("HTTPS_PORT", 5003)
+FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
+FLASK_DEBUG = os.getenv("FLASK_DEBUG", "0").lower() in {"1", "true", "yes", "on"}

@@ -151,12 +151,23 @@ Without `SAFE_RETURN_WAYPOINTS` the automatic home return is disabled — the op
 
 ```bash
 cd piper_cowork
+
+# First run on a new workstation:
+cp start.env.example .env
+# Edit .env: ROS setup paths, CAN interface, Piper_ros path.
+
 ./start.sh
-# ──► https://<host>:5002          desktop UI
-# ──► https://<host>:5002/mobile   touch-optimized mobile UI
+# ──► http://<host>:5002           desktop UI
+# ──► https://<host>:5003/mobile   touch-optimized mobile UI
 ```
 
-The server uses self-signed TLS (`cert.pem` / `key.pem`). Accept the browser warning on first visit.
+`start.sh` reads `.env` if present. For UI/backend-only development without a robot, run:
+
+```bash
+PIPER_START_ROS=0 ./start.sh
+```
+
+The mobile server uses self-signed TLS (`cert.pem` / `key.pem`). Accept the browser warning on first visit.
 
 ---
 

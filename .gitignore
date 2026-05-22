@@ -21,9 +21,11 @@ frontend/.cache/
 *.pem
 *.key
 *.crt
+.env
 
 # Dataset (large binary data — managed separately)
 /dataset/
+/exported/
 
 # Editor / OS
 .DS_Store
